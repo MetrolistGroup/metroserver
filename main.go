@@ -184,9 +184,10 @@ type RoomState struct {
 
 // UserInfo contains information about a user
 type UserInfo struct {
-	UserID   string `json:"user_id"`
-	Username string `json:"username"`
-	IsHost   bool   `json:"is_host"`
+	UserID      string `json:"user_id"`
+	Username    string `json:"username"`
+	IsHost      bool   `json:"is_host"`
+	IsConnected bool   `json:"is_connected"`
 }
 
 // ChatPayload is for chat messages
@@ -544,6 +545,14 @@ func (s *Server) handleClientDisconnect(c *Client) {
 	}
 	room.DisconnectedUsers[c.ID] = session
 
+	// Mark user as disconnected in room state
+	for i := range room.State.Users {
+		if room.State.Users[i].UserID == c.ID {
+			room.State.Users[i].IsConnected = false
+			break
+		}
+	}
+
 	// Track if host disconnected
 	if wasHost {
 		now := time.Now()
@@ -610,7 +619,7 @@ func (s *Server) handleReconnect(c *Client, payload json.RawMessage) {
 	}
 
 	// Check if session is expired
-	if time.Now().Sub(session.DisconnectAt) > ReconnectGracePeriod {
+	if time.Since(session.DisconnectAt) > ReconnectGracePeriod {
 		s.mu.Lock()
 		delete(s.sessions, p.SessionToken)
 		s.mu.Unlock()
@@ -641,6 +650,14 @@ func (s *Server) handleReconnect(c *Client, payload json.RawMessage) {
 	// Add back to room clients
 	room.Clients[c.ID] = c
 	delete(room.DisconnectedUsers, c.ID)
+
+	// Mark user as connected in room state
+	for i := range room.State.Users {
+		if room.State.Users[i].UserID == c.ID {
+			room.State.Users[i].IsConnected = true
+			break
+		}
+	}
 
 	// Restore host status if they were the host
 	if session.IsHost && room.HostDisconnectedAt != nil {
@@ -785,7 +802,7 @@ func (s *Server) handleCreateRoom(c *Client, payload json.RawMessage) {
 		State: &RoomState{
 			RoomCode:   code,
 			HostID:     c.ID,
-			Users:      []UserInfo{{UserID: c.ID, Username: c.Username, IsHost: true}},
+			Users:      []UserInfo{{UserID: c.ID, Username: c.Username, IsHost: true, IsConnected: true}},
 			IsPlaying:  false,
 			Position:   0,
 			LastUpdate: time.Now().UnixMilli(),
@@ -931,9 +948,10 @@ func (s *Server) handleApproveJoin(c *Client, payload json.RawMessage) {
 
 	// Update room state
 	room.State.Users = append(room.State.Users, UserInfo{
-		UserID:   joiningClient.ID,
-		Username: joiningClient.Username,
-		IsHost:   false,
+		UserID:      joiningClient.ID,
+		Username:    joiningClient.Username,
+		IsHost:      false,
+		IsConnected: true,
 	})
 
 	// Send approval to the joining user
@@ -1076,9 +1094,11 @@ func (s *Server) handlePlaybackAction(c *Client, payload json.RawMessage) {
 			return
 		}
 
+		// Allow 0 or negative duration - some tracks don't have duration metadata initially
+		// Use a default duration of 3 minutes if not provided
 		if p.TrackInfo.Duration <= 0 {
-			c.sendError(s.logger, "invalid_duration", "Track duration must be positive")
-			return
+			p.TrackInfo.Duration = 180000 // 3 minutes in ms
+			s.logger.Debug("Track duration not provided, using default", zap.String("track_id", p.TrackInfo.ID))
 		}
 
 		room.State.CurrentTrack = p.TrackInfo
