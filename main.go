@@ -27,24 +27,28 @@ const (
 	MsgTypePing           = "ping"
 	MsgTypeChat           = "chat"
 	MsgTypeRequestSync    = "request_sync"
+	MsgTypeReconnect      = "reconnect"
 
 	// Server -> Client
-	MsgTypeRoomCreated    = "room_created"
-	MsgTypeJoinRequest    = "join_request"
-	MsgTypeJoinApproved   = "join_approved"
-	MsgTypeJoinRejected   = "join_rejected"
-	MsgTypeUserJoined     = "user_joined"
-	MsgTypeUserLeft       = "user_left"
-	MsgTypeSyncPlayback   = "sync_playback"
-	MsgTypeBufferWait     = "buffer_wait"
-	MsgTypeBufferComplete = "buffer_complete"
-	MsgTypeError          = "error"
-	MsgTypePong           = "pong"
-	MsgTypeRoomState      = "room_state"
-	MsgTypeChatMessage    = "chat_message"
-	MsgTypeHostChanged    = "host_changed"
-	MsgTypeKicked         = "kicked"
-	MsgTypeSyncState      = "sync_state"
+	MsgTypeRoomCreated      = "room_created"
+	MsgTypeJoinRequest      = "join_request"
+	MsgTypeJoinApproved     = "join_approved"
+	MsgTypeJoinRejected     = "join_rejected"
+	MsgTypeUserJoined       = "user_joined"
+	MsgTypeUserLeft         = "user_left"
+	MsgTypeSyncPlayback     = "sync_playback"
+	MsgTypeBufferWait       = "buffer_wait"
+	MsgTypeBufferComplete   = "buffer_complete"
+	MsgTypeError            = "error"
+	MsgTypePong             = "pong"
+	MsgTypeRoomState        = "room_state"
+	MsgTypeChatMessage      = "chat_message"
+	MsgTypeHostChanged      = "host_changed"
+	MsgTypeKicked           = "kicked"
+	MsgTypeSyncState        = "sync_state"
+	MsgTypeReconnected      = "reconnected"
+	MsgTypeUserReconnected  = "user_reconnected"
+	MsgTypeUserDisconnected = "user_disconnected"
 )
 
 // Playback actions
@@ -73,8 +77,9 @@ type CreateRoomPayload struct {
 
 // RoomCreatedPayload is the response for room creation
 type RoomCreatedPayload struct {
-	RoomCode string `json:"room_code"`
-	UserID   string `json:"user_id"`
+	RoomCode     string `json:"room_code"`
+	UserID       string `json:"user_id"`
+	SessionToken string `json:"session_token"`
 }
 
 // JoinRoomPayload is for joining a room
@@ -102,9 +107,10 @@ type RejectJoinPayload struct {
 
 // JoinApprovedPayload is sent to the user when they are approved
 type JoinApprovedPayload struct {
-	RoomCode string     `json:"room_code"`
-	UserID   string     `json:"user_id"`
-	State    *RoomState `json:"state"`
+	RoomCode     string     `json:"room_code"`
+	UserID       string     `json:"user_id"`
+	SessionToken string     `json:"session_token"`
+	State        *RoomState `json:"state"`
 }
 
 // JoinRejectedPayload is sent to the user when they are rejected
@@ -221,31 +227,69 @@ type SyncStatePayload struct {
 	LastUpdate   int64      `json:"last_update"` // unix timestamp ms
 }
 
+// ReconnectPayload is for reconnecting to a room
+type ReconnectPayload struct {
+	SessionToken string `json:"session_token"`
+}
+
+// ReconnectedPayload is sent when successfully reconnected
+type ReconnectedPayload struct {
+	RoomCode string     `json:"room_code"`
+	UserID   string     `json:"user_id"`
+	State    *RoomState `json:"state"`
+	IsHost   bool       `json:"is_host"`
+}
+
+// UserReconnectedPayload is sent to other users when someone reconnects
+type UserReconnectedPayload struct {
+	UserID   string `json:"user_id"`
+	Username string `json:"username"`
+}
+
+// UserDisconnectedPayload is sent when a user temporarily disconnects
+type UserDisconnectedPayload struct {
+	UserID   string `json:"user_id"`
+	Username string `json:"username"`
+}
+
+// Session holds information about a disconnected user for reconnection
+type Session struct {
+	UserID       string
+	Username     string
+	RoomCode     string
+	IsHost       bool
+	DisconnectAt time.Time
+}
+
 // Client represents a connected WebSocket client
 type Client struct {
-	ID       string
-	Username string
-	Conn     *websocket.Conn
-	Room     *Room
-	Send     chan []byte
-	mu       sync.Mutex
+	ID           string
+	Username     string
+	SessionToken string
+	Conn         *websocket.Conn
+	Room         *Room
+	Send         chan []byte
+	mu           sync.Mutex
 }
 
 // Room represents a listening room
 type Room struct {
-	Code              string
-	Host              *Client
-	Clients           map[string]*Client
-	PendingJoins      map[string]*Client // Users waiting for approval
-	State             *RoomState
-	BufferingUsers    map[string]bool // Track which users are still buffering
-	HostStartPosition int64           // Host's position when buffering started
-	mu                sync.RWMutex
+	Code               string
+	Host               *Client
+	Clients            map[string]*Client
+	PendingJoins       map[string]*Client  // Users waiting for approval
+	DisconnectedUsers  map[string]*Session // Users temporarily disconnected
+	State              *RoomState
+	BufferingUsers     map[string]bool // Track which users are still buffering
+	HostStartPosition  int64           // Host's position when buffering started
+	HostDisconnectedAt *time.Time      // When the host disconnected (nil if connected)
+	mu                 sync.RWMutex
 }
 
 // Server is the main WebSocket server
 type Server struct {
 	rooms    map[string]*Room
+	sessions map[string]*Session // sessionToken -> Session
 	clients  map[*Client]bool
 	upgrader websocket.Upgrader
 	mu       sync.RWMutex
@@ -253,10 +297,18 @@ type Server struct {
 	rng      *rand.Rand
 }
 
+const (
+	// Grace period for reconnection (5 minutes)
+	ReconnectGracePeriod = 5 * time.Minute
+	// How often to clean up expired sessions
+	SessionCleanupInterval = 1 * time.Minute
+)
+
 func NewServer(logger *zap.Logger) *Server {
-	return &Server{
-		rooms:   make(map[string]*Room),
-		clients: make(map[*Client]bool),
+	s := &Server{
+		rooms:    make(map[string]*Room),
+		sessions: make(map[string]*Session),
+		clients:  make(map[*Client]bool),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Allow all origins for mobile app
@@ -266,6 +318,63 @@ func NewServer(logger *zap.Logger) *Server {
 		},
 		logger: logger,
 		rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+
+	// Start session cleanup goroutine
+	go s.cleanupExpiredSessions()
+
+	return s
+}
+
+func (s *Server) cleanupExpiredSessions() {
+	ticker := time.NewTicker(SessionCleanupInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.mu.Lock()
+		now := time.Now()
+		expiredTokens := make([]string, 0)
+
+		for token, session := range s.sessions {
+			if now.Sub(session.DisconnectAt) > ReconnectGracePeriod {
+				expiredTokens = append(expiredTokens, token)
+			}
+		}
+
+		for _, token := range expiredTokens {
+			session := s.sessions[token]
+			delete(s.sessions, token)
+			s.logger.Info("Session expired",
+				zap.String("user_id", session.UserID),
+				zap.String("room_code", session.RoomCode))
+
+			// Also clean up from room's disconnected users
+			if room, exists := s.rooms[session.RoomCode]; exists {
+				room.mu.Lock()
+				delete(room.DisconnectedUsers, session.UserID)
+
+				// Remove from room state users if still there
+				newUsers := make([]UserInfo, 0, len(room.State.Users))
+				for _, u := range room.State.Users {
+					if u.UserID != session.UserID {
+						newUsers = append(newUsers, u)
+					}
+				}
+				room.State.Users = newUsers
+
+				// Notify remaining users
+				for _, client := range room.Clients {
+					if client != nil {
+						client.sendMessage(s.logger, MsgTypeUserLeft, UserLeftPayload{
+							UserID:   session.UserID,
+							Username: session.Username,
+						})
+					}
+				}
+				room.mu.Unlock()
+			}
+		}
+		s.mu.Unlock()
 	}
 }
 
@@ -280,6 +389,15 @@ func (s *Server) generateRoomCode() string {
 
 func (s *Server) generateUserID() string {
 	return fmt.Sprintf("user_%d_%d", time.Now().UnixNano(), s.rng.Intn(10000))
+}
+
+func (s *Server) generateSessionToken() string {
+	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	token := make([]byte, 32)
+	for i := range token {
+		token[i] = chars[s.rng.Intn(len(chars))]
+	}
+	return string(token)
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -368,7 +486,7 @@ func (s *Server) removeClient(c *Client) {
 	s.mu.Unlock()
 
 	if c.Room != nil {
-		s.leaveRoom(c)
+		s.handleClientDisconnect(c)
 	}
 
 	// Check if send channel is still open before closing
@@ -384,6 +502,192 @@ func (s *Server) removeClient(c *Client) {
 	c.mu.Unlock()
 
 	s.logger.Info("Client disconnected", zap.String("client_id", c.ID))
+}
+
+// handleClientDisconnect handles a client disconnecting - creates a session for reconnection
+func (s *Server) handleClientDisconnect(c *Client) {
+	if c.Room == nil {
+		return
+	}
+
+	room := c.Room
+	room.mu.Lock()
+
+	wasHost := room.Host == c
+	username := c.Username
+
+	// Create session for reconnection
+	session := &Session{
+		UserID:       c.ID,
+		Username:     c.Username,
+		RoomCode:     room.Code,
+		IsHost:       wasHost,
+		DisconnectAt: time.Now(),
+	}
+
+	// Generate session token if not already present
+	if c.SessionToken == "" {
+		c.SessionToken = s.generateSessionToken()
+	}
+
+	// Store the session
+	s.mu.Lock()
+	s.sessions[c.SessionToken] = session
+	s.mu.Unlock()
+
+	// Remove from active clients but add to disconnected users
+	delete(room.Clients, c.ID)
+	delete(room.BufferingUsers, c.ID)
+
+	if room.DisconnectedUsers == nil {
+		room.DisconnectedUsers = make(map[string]*Session)
+	}
+	room.DisconnectedUsers[c.ID] = session
+
+	// Track if host disconnected
+	if wasHost {
+		now := time.Now()
+		room.HostDisconnectedAt = &now
+	}
+
+	c.Room = nil
+
+	// If room has no active clients and no disconnected users, delete it
+	if len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0 {
+		roomCode := room.Code
+		room.mu.Unlock()
+		s.mu.Lock()
+		delete(s.rooms, roomCode)
+		s.mu.Unlock()
+		s.logger.Info("Room deleted (empty)", zap.String("room_code", roomCode))
+		return
+	}
+
+	// If host disconnected but there are other active clients, notify them
+	// Don't transfer host yet - wait for reconnection grace period
+	room.mu.Unlock()
+
+	// Notify other users about the temporary disconnect
+	room.mu.RLock()
+	for _, client := range room.Clients {
+		if client != nil {
+			client.sendMessage(s.logger, MsgTypeUserDisconnected, UserDisconnectedPayload{
+				UserID:   c.ID,
+				Username: username,
+			})
+		}
+	}
+	room.mu.RUnlock()
+
+	s.logger.Info("User temporarily disconnected",
+		zap.String("username", username),
+		zap.String("user_id", c.ID),
+		zap.String("room_code", room.Code),
+		zap.Bool("was_host", wasHost),
+		zap.String("session_token", c.SessionToken))
+}
+
+// handleReconnect handles a client trying to reconnect to their room
+func (s *Server) handleReconnect(c *Client, payload json.RawMessage) {
+	var p ReconnectPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		c.sendError(s.logger, "invalid_payload", "Invalid reconnect payload")
+		return
+	}
+
+	if p.SessionToken == "" {
+		c.sendError(s.logger, "missing_session_token", "Session token is required")
+		return
+	}
+
+	s.mu.RLock()
+	session, exists := s.sessions[p.SessionToken]
+	s.mu.RUnlock()
+
+	if !exists {
+		c.sendError(s.logger, "session_not_found", "Session not found or expired")
+		return
+	}
+
+	// Check if session is expired
+	if time.Now().Sub(session.DisconnectAt) > ReconnectGracePeriod {
+		s.mu.Lock()
+		delete(s.sessions, p.SessionToken)
+		s.mu.Unlock()
+		c.sendError(s.logger, "session_expired", "Session has expired")
+		return
+	}
+
+	s.mu.RLock()
+	room, roomExists := s.rooms[session.RoomCode]
+	s.mu.RUnlock()
+
+	if !roomExists {
+		s.mu.Lock()
+		delete(s.sessions, p.SessionToken)
+		s.mu.Unlock()
+		c.sendError(s.logger, "room_not_found", "Room no longer exists")
+		return
+	}
+
+	room.mu.Lock()
+
+	// Restore the client
+	c.ID = session.UserID
+	c.Username = session.Username
+	c.SessionToken = p.SessionToken
+	c.Room = room
+
+	// Add back to room clients
+	room.Clients[c.ID] = c
+	delete(room.DisconnectedUsers, c.ID)
+
+	// Restore host status if they were the host
+	if session.IsHost && room.HostDisconnectedAt != nil {
+		room.Host = c
+		room.HostDisconnectedAt = nil
+
+		// Update IsHost flag in users list
+		for i := range room.State.Users {
+			room.State.Users[i].IsHost = room.State.Users[i].UserID == c.ID
+		}
+	}
+
+	isHost := room.Host == c
+	stateCopy := *room.State
+
+	room.mu.Unlock()
+
+	// Remove session since reconnection succeeded
+	s.mu.Lock()
+	delete(s.sessions, p.SessionToken)
+	s.mu.Unlock()
+
+	// Send reconnected message to the client
+	c.sendMessage(s.logger, MsgTypeReconnected, ReconnectedPayload{
+		RoomCode: room.Code,
+		UserID:   c.ID,
+		State:    &stateCopy,
+		IsHost:   isHost,
+	})
+
+	// Notify other users
+	room.mu.RLock()
+	for _, client := range room.Clients {
+		if client != nil && client.ID != c.ID {
+			client.sendMessage(s.logger, MsgTypeUserReconnected, UserReconnectedPayload{
+				UserID:   c.ID,
+				Username: c.Username,
+			})
+		}
+	}
+	room.mu.RUnlock()
+
+	s.logger.Info("User reconnected",
+		zap.String("username", c.Username),
+		zap.String("user_id", c.ID),
+		zap.String("room_code", room.Code),
+		zap.Bool("is_host", isHost))
 }
 
 func (s *Server) handleMessage(c *Client, data []byte) {
@@ -424,6 +728,8 @@ func (s *Server) handleMessage(c *Client, data []byte) {
 		s.handleChat(c, msg.Payload)
 	case MsgTypeRequestSync:
 		s.handleRequestSync(c)
+	case MsgTypeReconnect:
+		s.handleReconnect(c, msg.Payload)
 	default:
 		c.sendError(s.logger, "unknown_message_type", fmt.Sprintf("Unknown message type: %s", msg.Type))
 	}
@@ -467,13 +773,15 @@ func (s *Server) handleCreateRoom(c *Client, payload json.RawMessage) {
 	}
 
 	c.Username = p.Username
+	c.SessionToken = s.generateSessionToken()
 
 	room := &Room{
-		Code:           code,
-		Host:           c,
-		Clients:        make(map[string]*Client),
-		PendingJoins:   make(map[string]*Client),
-		BufferingUsers: make(map[string]bool),
+		Code:              code,
+		Host:              c,
+		Clients:           make(map[string]*Client),
+		PendingJoins:      make(map[string]*Client),
+		DisconnectedUsers: make(map[string]*Session),
+		BufferingUsers:    make(map[string]bool),
 		State: &RoomState{
 			RoomCode:   code,
 			HostID:     c.ID,
@@ -493,8 +801,9 @@ func (s *Server) handleCreateRoom(c *Client, payload json.RawMessage) {
 	s.mu.Unlock()
 
 	c.sendMessage(s.logger, MsgTypeRoomCreated, RoomCreatedPayload{
-		RoomCode: code,
-		UserID:   c.ID,
+		RoomCode:     code,
+		UserID:       c.ID,
+		SessionToken: c.SessionToken,
 	})
 
 	s.logger.Info("Room created",
@@ -618,6 +927,7 @@ func (s *Server) handleApproveJoin(c *Client, payload json.RawMessage) {
 	delete(room.PendingJoins, p.UserID)
 	room.Clients[joiningClient.ID] = joiningClient
 	joiningClient.Room = room
+	joiningClient.SessionToken = s.generateSessionToken()
 
 	// Update room state
 	room.State.Users = append(room.State.Users, UserInfo{
@@ -628,9 +938,10 @@ func (s *Server) handleApproveJoin(c *Client, payload json.RawMessage) {
 
 	// Send approval to the joining user
 	joiningClient.sendMessage(s.logger, MsgTypeJoinApproved, JoinApprovedPayload{
-		RoomCode: room.Code,
-		UserID:   joiningClient.ID,
-		State:    room.State,
+		RoomCode:     room.Code,
+		UserID:       joiningClient.ID,
+		SessionToken: joiningClient.SessionToken,
+		State:        room.State,
 	})
 
 	// Notify all other users
@@ -1134,6 +1445,14 @@ func (s *Server) leaveRoom(c *Client) {
 	delete(room.Clients, c.ID)
 	delete(room.BufferingUsers, c.ID)
 	delete(room.PendingJoins, c.ID)
+	delete(room.DisconnectedUsers, c.ID)
+
+	// Also remove any session token for this user (intentional leave = no reconnect)
+	if c.SessionToken != "" {
+		s.mu.Lock()
+		delete(s.sessions, c.SessionToken)
+		s.mu.Unlock()
+	}
 
 	username := c.Username
 	wasHost := room.Host == c
@@ -1149,8 +1468,8 @@ func (s *Server) leaveRoom(c *Client) {
 
 	c.Room = nil
 
-	// If room is empty, delete it
-	if len(room.Clients) == 0 {
+	// If room is empty (no active or disconnected users), delete it
+	if len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0 {
 		roomCode := room.Code
 		room.mu.Unlock()
 		s.mu.Lock()
