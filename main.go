@@ -1,13 +1,17 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/rand"
+	mathrand "math/rand"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
@@ -25,7 +29,6 @@ const (
 	MsgTypeBufferReady       = "buffer_ready"
 	MsgTypeKickUser          = "kick_user"
 	MsgTypePing              = "ping"
-	MsgTypeChat              = "chat"
 	MsgTypeRequestSync       = "request_sync"
 	MsgTypeReconnect         = "reconnect"
 	MsgTypeSuggestTrack      = "suggest_track"
@@ -45,7 +48,6 @@ const (
 	MsgTypeError              = "error"
 	MsgTypePong               = "pong"
 	MsgTypeRoomState          = "room_state"
-	MsgTypeChatMessage        = "chat_message"
 	MsgTypeHostChanged        = "host_changed"
 	MsgTypeKicked             = "kicked"
 	MsgTypeSyncState          = "sync_state"
@@ -228,19 +230,6 @@ type UserInfo struct {
 	IsConnected bool   `json:"is_connected"`
 }
 
-// ChatPayload is for chat messages
-type ChatPayload struct {
-	Message string `json:"message"`
-}
-
-// ChatMessagePayload is sent to all users in a room
-type ChatMessagePayload struct {
-	UserID    string `json:"user_id"`
-	Username  string `json:"username"`
-	Message   string `json:"message"`
-	Timestamp int64  `json:"timestamp"`
-}
-
 // KickUserPayload is for kicking a user from the room
 type KickUserPayload struct {
 	UserID string `json:"user_id"`
@@ -300,6 +289,12 @@ type Session struct {
 	DisconnectAt time.Time
 }
 
+// RateLimiter tracks message rates per client
+type RateLimiter struct {
+	messages []time.Time
+	mu       sync.Mutex
+}
+
 // Client represents a connected WebSocket client
 type Client struct {
 	ID           string
@@ -310,6 +305,7 @@ type Client struct {
 	Send         chan []byte
 	closed       bool
 	mu           sync.Mutex
+	rateLimiter  *RateLimiter
 }
 
 // Room represents a listening room
@@ -343,7 +339,7 @@ type Server struct {
 	upgrader websocket.Upgrader
 	mu       sync.RWMutex
 	logger   *zap.Logger
-	rng      *rand.Rand
+	rng      *mathrand.Rand
 }
 
 const (
@@ -351,6 +347,21 @@ const (
 	ReconnectGracePeriod = 5 * time.Minute
 	// How often to clean up expired sessions
 	SessionCleanupInterval = 1 * time.Minute
+	// Security limits
+	MaxUsernameLength    = 50
+	MaxRoomCodeLength    = 10
+	MaxMessageLength     = 500
+	MaxTrackTitleLength  = 200
+	MaxTrackArtistLength = 200
+	MaxQueueSize         = 1000
+	// Rate limiting
+	RateLimitWindow      = time.Minute
+	MaxMessagesPerWindow = 100
+	// Connection limits
+	MaxReadMessageSize = 65536
+	WriteTimeout       = 10 * time.Second
+	ReadTimeout        = 60 * time.Second
+	PongTimeout        = 10 * time.Second
 )
 
 func NewServer(logger *zap.Logger) *Server {
@@ -366,10 +377,10 @@ func NewServer(logger *zap.Logger) *Server {
 			WriteBufferSize: 1024,
 		},
 		logger: logger,
-		rng:    rand.New(rand.NewSource(time.Now().UnixNano())),
+		rng:    mathrand.New(mathrand.NewSource(time.Now().UnixNano())),
 	}
 
-	// Start session cleanup goroutine
+	// Start cleanup goroutines
 	go s.cleanupExpiredSessions()
 
 	return s
@@ -428,7 +439,7 @@ func (s *Server) cleanupExpiredSessions() {
 }
 
 func (s *Server) generateRoomCode() string {
-	const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789" // Removed confusing chars
+	const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 	code := make([]byte, 6)
 	for i := range code {
 		code[i] = chars[s.rng.Intn(len(chars))]
@@ -441,25 +452,29 @@ func (s *Server) generateUserID() string {
 }
 
 func (s *Server) generateSessionToken() string {
-	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	token := make([]byte, 32)
-	for i := range token {
-		token[i] = chars[s.rng.Intn(len(chars))]
+	// Use crypto/rand for secure token generation
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		s.logger.Error("Failed to generate secure token", zap.Error(err))
+		// Fallback to less secure but functional token
+		return fmt.Sprintf("token_%d_%d", time.Now().UnixNano(), s.rng.Intn(1000000))
 	}
-	return string(token)
+	return hex.EncodeToString(b)
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.logger.Warn("WebSocket upgrade error", zap.Error(err))
+		s.mu.Unlock()
 		return
 	}
 
 	client := &Client{
-		ID:   s.generateUserID(),
-		Conn: conn,
-		Send: make(chan []byte, 256),
+		ID:          s.generateUserID(),
+		Conn:        conn,
+		Send:        make(chan []byte, 256),
+		rateLimiter: &RateLimiter{messages: make([]time.Time, 0)},
 	}
 
 	s.mu.Lock()
@@ -508,10 +523,10 @@ func (c *Client) readPump(s *Server) {
 		c.Conn.Close()
 	}()
 
-	c.Conn.SetReadLimit(65536)
-	c.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.Conn.SetReadLimit(MaxReadMessageSize)
+	c.Conn.SetReadDeadline(time.Now().Add(ReadTimeout))
 	c.Conn.SetPongHandler(func(string) error {
-		c.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		c.Conn.SetReadDeadline(time.Now().Add(ReadTimeout))
 		return nil
 	})
 
@@ -751,6 +766,38 @@ func (s *Server) handleReconnect(c *Client, payload json.RawMessage) {
 		zap.Bool("is_host", isHost))
 }
 
+// sanitizeString removes potentially dangerous characters and limits length
+func sanitizeString(s string, maxLen int) string {
+	// Remove null bytes and other control characters
+	s = strings.Map(func(r rune) rune {
+		if r == 0 || (r < 32 && r != '\t' && r != '\n' && r != '\r') {
+			return -1
+		}
+		return r
+	}, s)
+
+	// Trim whitespace
+	s = strings.TrimSpace(s)
+
+	// Validate UTF-8
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "")
+	}
+
+	// Limit length
+	if len(s) > maxLen {
+		// Ensure we don't cut in the middle of a multi-byte character
+		for i := maxLen; i > 0 && i > maxLen-4; i-- {
+			if utf8.ValidString(s[:i]) {
+				return s[:i]
+			}
+		}
+		return s[:maxLen]
+	}
+
+	return s
+}
+
 func (s *Server) handleMessage(c *Client, data []byte) {
 	var msg Message
 	if err := json.Unmarshal(data, &msg); err != nil {
@@ -785,8 +832,6 @@ func (s *Server) handleMessage(c *Client, data []byte) {
 		s.handleKickUser(c, msg.Payload)
 	case MsgTypePing:
 		c.sendMessage(s.logger, MsgTypePong, nil)
-	case MsgTypeChat:
-		s.handleChat(c, msg.Payload)
 	case MsgTypeRequestSync:
 		s.handleRequestSync(c)
 	case MsgTypeReconnect:
@@ -813,7 +858,19 @@ func (s *Server) handleSuggestTrack(c *Client, payload json.RawMessage) {
 		c.sendError(s.logger, "not_in_room", "You are not in a room")
 		return
 	}
-	if p.TrackInfo == nil || p.TrackInfo.ID == "" || p.TrackInfo.Title == "" {
+
+	if p.TrackInfo == nil {
+		c.sendError(s.logger, "missing_track_info", "Track info is required")
+		return
+	}
+
+	// Validate and sanitize track info
+	p.TrackInfo.ID = sanitizeString(p.TrackInfo.ID, 200)
+	p.TrackInfo.Title = sanitizeString(p.TrackInfo.Title, MaxTrackTitleLength)
+	p.TrackInfo.Artist = sanitizeString(p.TrackInfo.Artist, MaxTrackArtistLength)
+	p.TrackInfo.Album = sanitizeString(p.TrackInfo.Album, MaxTrackArtistLength)
+
+	if p.TrackInfo.ID == "" || p.TrackInfo.Title == "" {
 		c.sendError(s.logger, "invalid_track_info", "Track must have ID and title")
 		return
 	}
@@ -888,7 +945,7 @@ func (s *Server) handleApproveSuggestion(c *Client, payload json.RawMessage) {
 
 	// Update room state queue: insert next (front of upcoming queue)
 	if suggestion.Track != nil {
-		if len(room.State.Queue) >= 1000 {
+		if len(room.State.Queue) >= MaxQueueSize {
 			c.sendError(s.logger, "queue_full", "Queue is full")
 			return
 		}
@@ -977,9 +1034,10 @@ func (s *Server) handleCreateRoom(c *Client, payload json.RawMessage) {
 		return
 	}
 
-	// Validate username length
-	if len(p.Username) > 100 {
-		c.sendError(s.logger, "username_too_long", "Username must be 100 characters or less")
+	// Sanitize and validate username
+	p.Username = sanitizeString(p.Username, MaxUsernameLength)
+	if p.Username == "" {
+		c.sendError(s.logger, "invalid_username", "Username is invalid")
 		return
 	}
 
@@ -1054,13 +1112,22 @@ func (s *Server) handleJoinRoom(c *Client, payload json.RawMessage) {
 		return
 	}
 
-	if len(p.Username) > 100 {
-		c.sendError(s.logger, "username_too_long", "Username must be 100 characters or less")
+	// Sanitize and validate username
+	p.Username = sanitizeString(p.Username, MaxUsernameLength)
+	if p.Username == "" {
+		c.sendError(s.logger, "invalid_username", "Username is invalid")
 		return
 	}
 
 	if p.RoomCode == "" {
 		c.sendError(s.logger, "missing_room_code", "Room code is required")
+		return
+	}
+
+	// Sanitize and validate room code
+	p.RoomCode = sanitizeString(strings.ToUpper(p.RoomCode), MaxRoomCodeLength)
+	if p.RoomCode == "" {
+		c.sendError(s.logger, "invalid_room_code", "Room code is invalid")
 		return
 	}
 
@@ -1317,6 +1384,12 @@ func (s *Server) handlePlaybackAction(c *Client, payload json.RawMessage) {
 			return
 		}
 
+		// Validate and sanitize track info
+		p.TrackInfo.ID = sanitizeString(p.TrackInfo.ID, 200)
+		p.TrackInfo.Title = sanitizeString(p.TrackInfo.Title, MaxTrackTitleLength)
+		p.TrackInfo.Artist = sanitizeString(p.TrackInfo.Artist, MaxTrackArtistLength)
+		p.TrackInfo.Album = sanitizeString(p.TrackInfo.Album, MaxTrackArtistLength)
+
 		if p.TrackInfo.ID == "" || p.TrackInfo.Title == "" {
 			c.sendError(s.logger, "invalid_track_info", "Track must have ID and title")
 			return
@@ -1384,13 +1457,19 @@ func (s *Server) handlePlaybackAction(c *Client, payload json.RawMessage) {
 			return
 		}
 
+		// Validate and sanitize track info
+		p.TrackInfo.ID = sanitizeString(p.TrackInfo.ID, 200)
+		p.TrackInfo.Title = sanitizeString(p.TrackInfo.Title, MaxTrackTitleLength)
+		p.TrackInfo.Artist = sanitizeString(p.TrackInfo.Artist, MaxTrackArtistLength)
+		p.TrackInfo.Album = sanitizeString(p.TrackInfo.Album, MaxTrackArtistLength)
+
 		if p.TrackInfo.ID == "" || p.TrackInfo.Title == "" {
 			c.sendError(s.logger, "invalid_track_info", "Track must have ID and title")
 			return
 		}
 
 		// Limit queue size to prevent memory issues
-		if len(room.State.Queue) >= 1000 {
+		if len(room.State.Queue) >= MaxQueueSize {
 			c.sendError(s.logger, "queue_full", "Queue is full")
 			return
 		}
@@ -1629,50 +1708,6 @@ func (s *Server) handleKickUser(c *Client, payload json.RawMessage) {
 		zap.String("username", kickedUsername),
 		zap.String("user_id", p.UserID),
 		zap.String("room_code", room.Code))
-}
-
-func (s *Server) handleChat(c *Client, payload json.RawMessage) {
-	var p ChatPayload
-	if err := json.Unmarshal(payload, &p); err != nil {
-		c.sendError(s.logger, "invalid_payload", "Invalid chat payload")
-		return
-	}
-
-	if c.Room == nil {
-		c.sendError(s.logger, "not_in_room", "You are not in a room")
-		return
-	}
-
-	if p.Message == "" {
-		return // Silently ignore empty messages
-	}
-
-	// Limit message length
-	const maxMessageLength = 500
-	if len(p.Message) > maxMessageLength {
-		p.Message = p.Message[:maxMessageLength]
-	}
-
-	room := c.Room
-	room.mu.RLock()
-	defer room.mu.RUnlock()
-
-	if len(room.Clients) == 0 {
-		return // Room is empty, don't send
-	}
-
-	chatMsg := ChatMessagePayload{
-		UserID:    c.ID,
-		Username:  c.Username,
-		Message:   p.Message,
-		Timestamp: time.Now().UnixMilli(),
-	}
-
-	for _, client := range room.Clients {
-		if client != nil {
-			client.sendMessage(s.logger, MsgTypeChatMessage, chatMsg)
-		}
-	}
 }
 
 func (s *Server) handleRequestSync(c *Client) {
