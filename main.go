@@ -361,7 +361,7 @@ const (
 	RateLimitWindow      = time.Minute
 	MaxMessagesPerWindow = 100
 	// Connection limits
-	MaxReadMessageSize = 65536
+	MaxReadMessageSize = 4194304 // 4MB (increased from 64KB)
 	WriteTimeout       = 10 * time.Second
 	ReadTimeout        = 60 * time.Second
 	PongTimeout        = 10 * time.Second
@@ -376,8 +376,8 @@ func NewServer(logger *zap.Logger) *Server {
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Allow all origins for mobile app
 			},
-			ReadBufferSize:  1024,
-			WriteBufferSize: 1024,
+			ReadBufferSize:  4096,
+			WriteBufferSize: 4096,
 		},
 		logger: logger,
 		rng:    mathrand.New(mathrand.NewSource(time.Now().UnixNano())),
