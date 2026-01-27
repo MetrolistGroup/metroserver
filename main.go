@@ -182,12 +182,13 @@ type SuggestionRejectedPayload struct {
 
 // TrackInfo contains information about a track
 type TrackInfo struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Artist    string `json:"artist"`
-	Album     string `json:"album,omitempty"`
-	Duration  int64  `json:"duration"` // milliseconds
-	Thumbnail string `json:"thumbnail,omitempty"`
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	Artist      string `json:"artist"`
+	Album       string `json:"album,omitempty"`
+	Duration    int64  `json:"duration"` // milliseconds
+	Thumbnail   string `json:"thumbnail,omitempty"`
+	SuggestedBy string `json:"suggested_by,omitempty"`
 }
 
 // BufferReadyPayload is sent when a user has finished buffering
@@ -441,8 +442,8 @@ func (s *Server) cleanupExpiredSessions() {
 }
 
 func (s *Server) generateRoomCode() string {
-	const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-	code := make([]byte, 6)
+	const chars = "1234567890QWERTYUPASDFGHJLKZXCVBNM"
+	code := make([]byte, 8)
 	for i := range code {
 		code[i] = chars[s.rng.Intn(len(chars))]
 	}
@@ -951,6 +952,7 @@ func (s *Server) handleApproveSuggestion(c *Client, payload json.RawMessage) {
 			c.sendError(s.logger, "queue_full", "Queue is full")
 			return
 		}
+		suggestion.Track.SuggestedBy = suggestion.FromUsername
 		room.State.Queue = append([]TrackInfo{*suggestion.Track}, room.State.Queue...)
 	}
 
