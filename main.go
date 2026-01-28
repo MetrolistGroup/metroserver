@@ -733,8 +733,15 @@ func (s *Server) handleReconnect(c *Client, payload json.RawMessage) {
 		}
 	}
 
+	// Calculate live position for reconnect state
+	liveState := *room.State
+	if liveState.IsPlaying {
+		elapsed := time.Now().UnixMilli() - liveState.LastUpdate
+		liveState.Position += elapsed
+	}
+	liveState.LastUpdate = time.Now().UnixMilli()
+
 	isHost := room.Host == c
-	stateCopy := *room.State
 
 	room.mu.Unlock()
 
@@ -743,11 +750,11 @@ func (s *Server) handleReconnect(c *Client, payload json.RawMessage) {
 	delete(s.sessions, p.SessionToken)
 	s.mu.Unlock()
 
-	// Send reconnected message to the client
+	// Send reconnected message to the client with LIVE state
 	c.sendMessage(s.logger, MsgTypeReconnected, ReconnectedPayload{
 		RoomCode: room.Code,
 		UserID:   c.ID,
-		State:    &stateCopy,
+		State:    &liveState,
 		IsHost:   isHost,
 	})
 
@@ -1759,23 +1766,30 @@ func (s *Server) handleRequestSync(c *Client) {
 	room.mu.RLock()
 	defer room.mu.RUnlock()
 
-	// Calculate current position based on time elapsed since last update
+	// Calculate live position
 	currentPosition := room.State.Position
-	if room.State.IsPlaying {
-		elapsed := time.Now().UnixMilli() - room.State.LastUpdate
-		currentPosition = room.State.Position + elapsed
+	elapsed := time.Now().UnixMilli() - room.State.LastUpdate
+	if room.State.IsPlaying || (room.Host != nil && room.HostDisconnectedAt == nil) {
+		currentPosition += elapsed
+	}
+
+	responsePlaying := room.State.IsPlaying
+	if room.Host != nil && room.HostDisconnectedAt == nil {
+		responsePlaying = true
 	}
 
 	s.logger.Debug("Sync request received",
 		zap.String("username", c.Username),
 		zap.String("user_id", c.ID),
 		zap.Bool("has_track", room.State.CurrentTrack != nil),
-		zap.Bool("is_playing", room.State.IsPlaying),
-		zap.Int64("position", currentPosition))
+		zap.Bool("server_playing", room.State.IsPlaying),
+		zap.Bool("response_playing", responsePlaying),
+		zap.Int64("position", currentPosition),
+		zap.Int64("elapsed_ms", elapsed))
 
 	c.sendMessage(s.logger, MsgTypeSyncState, SyncStatePayload{
 		CurrentTrack: room.State.CurrentTrack,
-		IsPlaying:    room.State.IsPlaying,
+		IsPlaying:    responsePlaying,
 		Position:     currentPosition,
 		LastUpdate:   time.Now().UnixMilli(),
 	})
