@@ -227,6 +227,8 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 		return &pb.BufferReadyPayload{TrackId: p.TrackID}, nil
 	case *KickUserPayload:
 		return &pb.KickUserPayload{UserId: p.UserID, Reason: p.Reason}, nil
+	case *TransferHostPayload:
+		return &pb.TransferHostPayload{NewHostId: p.NewHostID}, nil
 	case *SuggestTrackPayload:
 		pbPayload := &pb.SuggestTrackPayload{}
 		if p.TrackInfo != nil {
@@ -384,6 +386,12 @@ func fromProtoMessage(msgType string, data []byte) (interface{}, error) {
 			return nil, err
 		}
 		return &KickUserPayload{UserID: pb.UserId, Reason: pb.Reason}, nil
+	case MsgTypeTransferHost:
+		var pb pb.TransferHostPayload
+		if err := proto.Unmarshal(data, &pb); err != nil {
+			return nil, err
+		}
+		return &TransferHostPayload{NewHostID: pb.NewHostId}, nil
 	case MsgTypeSuggestTrack:
 		var pbMsg pb.SuggestTrackPayload
 		if err := proto.Unmarshal(data, &pbMsg); err != nil {

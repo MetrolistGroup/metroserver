@@ -28,6 +28,7 @@ const (
 	MsgTypePlaybackAction    = "playback_action"
 	MsgTypeBufferReady       = "buffer_ready"
 	MsgTypeKickUser          = "kick_user"
+	MsgTypeTransferHost      = "transfer_host"
 	MsgTypePing              = "ping"
 	MsgTypeRequestSync       = "request_sync"
 	MsgTypeReconnect         = "reconnect"
@@ -241,6 +242,11 @@ type UserInfo struct {
 type KickUserPayload struct {
 	UserID string `json:"user_id"`
 	Reason string `json:"reason,omitempty"`
+}
+
+// TransferHostPayload is for transferring host role to another user
+type TransferHostPayload struct {
+	NewHostID string `json:"new_host_id"`
 }
 
 // KickedPayload is sent to the user when they are kicked
@@ -852,6 +858,8 @@ func (s *Server) handleMessage(c *Client, data []byte) {
 		s.handleBufferReady(c, payloadBytes, format)
 	case MsgTypeKickUser:
 		s.handleKickUser(c, payloadBytes, format)
+	case MsgTypeTransferHost:
+		s.handleTransferHost(c, payloadBytes, format)
 	case MsgTypePing:
 		c.sendMessage(s.logger, MsgTypePong, nil)
 	case MsgTypeRequestSync:
@@ -1776,6 +1784,82 @@ func (s *Server) handleKickUser(c *Client, payload []byte, format MessageFormat)
 		zap.String("username", kickedUsername),
 		zap.String("user_id", p.UserID),
 		zap.String("room_code", room.Code))
+}
+
+func (s *Server) handleTransferHost(c *Client, payload []byte, format MessageFormat) {
+	var p TransferHostPayload
+	if err := decodePayload(payload, format, MsgTypeTransferHost, &p); err != nil {
+		c.sendError(s.logger, "invalid_payload", "Invalid transfer host payload")
+		return
+	}
+
+	if p.NewHostID == "" {
+		c.sendError(s.logger, "missing_user_id", "New host user ID is required")
+		return
+	}
+
+	if c.Room == nil {
+		c.sendError(s.logger, "not_in_room", "You are not in a room")
+		return
+	}
+
+	room := c.Room
+	room.mu.Lock()
+	defer room.mu.Unlock()
+
+	// Only current host can transfer ownership
+	if room.Host == nil || room.Host != c {
+		c.sendError(s.logger, "not_host", "Only the host can transfer ownership")
+		return
+	}
+
+	// Cannot transfer to self
+	if p.NewHostID == c.ID {
+		c.sendError(s.logger, "cannot_transfer_to_self", "You are already the host")
+		return
+	}
+
+	// Find new host client
+	newHostClient, exists := room.Clients[p.NewHostID]
+	if !exists || newHostClient == nil {
+		c.sendError(s.logger, "user_not_found", "Target user not found in room")
+		return
+	}
+
+	// Transfer host role
+	oldHostID := c.ID
+	oldHostName := c.Username
+	newHostName := newHostClient.Username
+
+	room.Host = newHostClient
+	room.State.HostID = newHostClient.ID
+
+	// Update users list in state
+	for i := range room.State.Users {
+		if room.State.Users[i].UserID == oldHostID {
+			room.State.Users[i].IsHost = false
+		}
+		if room.State.Users[i].UserID == p.NewHostID {
+			room.State.Users[i].IsHost = true
+		}
+	}
+
+	// Notify all users about the host change
+	hostChangedPayload := HostChangedPayload{
+		NewHostID:   newHostClient.ID,
+		NewHostName: newHostName,
+	}
+
+	for _, client := range room.Clients {
+		if client != nil {
+			client.sendMessage(s.logger, MsgTypeHostChanged, hostChangedPayload)
+		}
+	}
+
+	s.logger.Info("Host transferred",
+		zap.String("room_code", room.Code),
+		zap.String("old_host", oldHostName),
+		zap.String("new_host", newHostName))
 }
 
 func (s *Server) handleRequestSync(c *Client) {
