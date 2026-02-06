@@ -325,29 +325,29 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 func fromProtoMessage(msgType string, data []byte) (interface{}, error) {
 	switch msgType {
 	case MsgTypeCreateRoom:
-		var pb pb.CreateRoomPayload
-		if err := proto.Unmarshal(data, &pb); err != nil {
+		var pbb pb.CreateRoomPayload
+		if err := proto.Unmarshal(data, &pbb); err != nil {
 			return nil, err
 		}
-		return &CreateRoomPayload{Username: pb.Username}, nil
+		return &CreateRoomPayload{Username: pbb.Username}, nil
 	case MsgTypeJoinRoom:
-		var pb pb.JoinRoomPayload
-		if err := proto.Unmarshal(data, &pb); err != nil {
+		var pbb pb.JoinRoomPayload
+		if err := proto.Unmarshal(data, &pbb); err != nil {
 			return nil, err
 		}
-		return &JoinRoomPayload{RoomCode: pb.RoomCode, Username: pb.Username}, nil
+		return &JoinRoomPayload{RoomCode: pbb.RoomCode, Username: pbb.Username}, nil
 	case MsgTypeApproveJoin:
-		var pb pb.ApproveJoinPayload
-		if err := proto.Unmarshal(data, &pb); err != nil {
+		var pbb pb.ApproveJoinPayload
+		if err := proto.Unmarshal(data, &pbb); err != nil {
 			return nil, err
 		}
-		return &ApproveJoinPayload{UserID: pb.UserId}, nil
+		return &ApproveJoinPayload{UserID: pbb.UserId}, nil
 	case MsgTypeRejectJoin:
-		var pb pb.RejectJoinPayload
-		if err := proto.Unmarshal(data, &pb); err != nil {
+		var pbb pb.RejectJoinPayload
+		if err := proto.Unmarshal(data, &pbb); err != nil {
 			return nil, err
 		}
-		return &RejectJoinPayload{UserID: pb.UserId, Reason: pb.Reason}, nil
+		return &RejectJoinPayload{UserID: pbb.UserId, Reason: pbb.Reason}, nil
 	case MsgTypePlaybackAction:
 		var pbMsg pb.PlaybackActionPayload
 		if err := proto.Unmarshal(data, &pbMsg); err != nil {

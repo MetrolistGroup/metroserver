@@ -47,7 +47,6 @@ const (
 	MsgTypeBufferComplete     = "buffer_complete"
 	MsgTypeError              = "error"
 	MsgTypePong               = "pong"
-	MsgTypeRoomState          = "room_state"
 	MsgTypeHostChanged        = "host_changed"
 	MsgTypeKicked             = "kicked"
 	MsgTypeSyncState          = "sync_state"
@@ -360,18 +359,12 @@ const (
 	// Security limits
 	MaxUsernameLength    = 50
 	MaxRoomCodeLength    = 10
-	MaxMessageLength     = 500
 	MaxTrackTitleLength  = 200
 	MaxTrackArtistLength = 200
 	MaxQueueSize         = 1000
-	// Rate limiting
-	RateLimitWindow      = time.Minute
-	MaxMessagesPerWindow = 100
 	// Connection limits
 	MaxReadMessageSize = 4194304 // 4MB (increased from 64KB)
-	WriteTimeout       = 10 * time.Second
 	ReadTimeout        = 60 * time.Second
-	PongTimeout        = 10 * time.Second
 )
 
 func NewServer(logger *zap.Logger) *Server {
@@ -806,7 +799,7 @@ func sanitizeString(s string, maxLen int) string {
 
 	// Limit length
 	if len(s) > maxLen {
-		// Ensure we don't cut in the middle of a multi-byte character
+		// Ensure we don't cut in the middle of a multibyte character
 		for i := maxLen; i > 0 && i > maxLen-4; i-- {
 			if utf8.ValidString(s[:i]) {
 				return s[:i]
