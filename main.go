@@ -396,63 +396,79 @@ func (s *Server) cleanupExpiredSessions() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		s.mu.Lock()
 		now := time.Now()
 		minRetentionTime := s.startTime.Add(MinRoomRetentionAfterRestart)
-		expiredTokens := make([]string, 0)
 
+		// First, determine which sessions have expired without holding any room locks.
+		s.mu.Lock()
+		expired := make([]*Session, 0)
 		for token, session := range s.sessions {
 			if now.Sub(session.DisconnectAt) > ReconnectGracePeriod {
-				expiredTokens = append(expiredTokens, token)
-			}
-		}
-
-		for _, token := range expiredTokens {
-			session := s.sessions[token]
-			delete(s.sessions, token)
-			s.logger.Info("Session expired",
-				zap.String("user_id", session.UserID),
-				zap.String("room_code", session.RoomCode))
-
-			// Also clean up from room's disconnected users
-			if room, exists := s.rooms[session.RoomCode]; exists {
-				room.mu.Lock()
-				delete(room.DisconnectedUsers, session.UserID)
-
-				// Remove from room state users if still there
-				newUsers := make([]UserInfo, 0, len(room.State.Users))
-				for _, u := range room.State.Users {
-					if u.UserID != session.UserID {
-						newUsers = append(newUsers, u)
-					}
-				}
-				room.State.Users = newUsers
-
-				// Check if room should be deleted (no active clients, no disconnected users)
-				// Only delete if we're past the minimum retention time after server start
-				if len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0 {
-					if now.After(minRetentionTime) {
-						room.mu.Unlock()
-						delete(s.rooms, session.RoomCode)
-						s.logger.Info("Deleted empty room",
-							zap.String("room_code", session.RoomCode))
-						continue
-					}
-				}
-
-				// Notify remaining users
-				for _, client := range room.Clients {
-					if client != nil {
-						client.sendMessage(s.logger, MsgTypeUserLeft, UserLeftPayload{
-							UserID:   session.UserID,
-							Username: session.Username,
-						})
-					}
-				}
-				room.mu.Unlock()
+				expired = append(expired, session)
+				delete(s.sessions, token)
+				s.logger.Info("Session expired",
+					zap.String("user_id", session.UserID),
+					zap.String("room_code", session.RoomCode))
 			}
 		}
 		s.mu.Unlock()
+
+		// Now process the side effects for each expired session without
+		// ever taking the server lock and a room lock at the same time.
+		for _, session := range expired {
+			s.mu.RLock()
+			room, exists := s.rooms[session.RoomCode]
+			s.mu.RUnlock()
+			if !exists || room == nil {
+				continue
+			}
+
+			room.mu.Lock()
+
+			delete(room.DisconnectedUsers, session.UserID)
+
+			// Remove from room state users if still there
+			newUsers := make([]UserInfo, 0, len(room.State.Users))
+			for _, u := range room.State.Users {
+				if u.UserID != session.UserID {
+					newUsers = append(newUsers, u)
+				}
+			}
+			room.State.Users = newUsers
+
+			// Capture information needed after releasing the room lock
+			shouldDeleteRoom := len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0 && now.After(minRetentionTime)
+			roomCode := room.Code
+			remainingClients := make([]*Client, 0, len(room.Clients))
+			for _, client := range room.Clients {
+				if client != nil {
+					remainingClients = append(remainingClients, client)
+				}
+			}
+
+			room.mu.Unlock()
+
+			// If the room is now empty and past the retention window, delete it.
+			if shouldDeleteRoom {
+				s.mu.Lock()
+				// Re-check to avoid races where the room might have been recreated.
+				if currentRoom, exists := s.rooms[roomCode]; exists && currentRoom == room {
+					delete(s.rooms, roomCode)
+					s.logger.Info("Deleted empty room",
+						zap.String("room_code", roomCode))
+				}
+				s.mu.Unlock()
+				continue
+			}
+
+			// Notify remaining users that the expired session permanently left.
+			for _, client := range remainingClients {
+				client.sendMessage(s.logger, MsgTypeUserLeft, UserLeftPayload{
+					UserID:   session.UserID,
+					Username: session.Username,
+				})
+			}
+		}
 	}
 }
 
@@ -1102,19 +1118,22 @@ func (s *Server) handleCreateRoom(c *Client, payload []byte) {
 	}
 
 	// Generate unique room code with retry limit
-	var code string
+	var (
+		code   string
+		exists bool
+	)
 	maxRetries := 100
 	for i := 0; i < maxRetries; i++ {
 		code = s.generateRoomCode()
 		s.mu.RLock()
-		_, exists := s.rooms[code]
+		_, exists = s.rooms[code]
 		s.mu.RUnlock()
 		if !exists {
 			break
 		}
 	}
 
-	if code == "" {
+	if code == "" || exists {
 		s.logger.Error("Failed to generate unique room code after retries")
 		c.sendError(s.logger, "server_error", "Failed to create room")
 		return
