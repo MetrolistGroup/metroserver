@@ -29,6 +29,12 @@ go build -o main .
 PORT=9000 ./main
 ```
 
+## Configuration
+
+`PORT` sets the HTTP/WebSocket port. It defaults to `8080`.
+
+The server writes graceful-shutdown recovery state to `server_state.json` with `0600` permissions.
+
 ## Docker
 
 ```bash

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -22,21 +24,22 @@ import (
 // Message types
 const (
 	// Client -> Server
-	MsgTypeCreateRoom        = "create_room"
-	MsgTypeJoinRoom          = "join_room"
-	MsgTypeLeaveRoom         = "leave_room"
-	MsgTypeApproveJoin       = "approve_join"
-	MsgTypeRejectJoin        = "reject_join"
-	MsgTypePlaybackAction    = "playback_action"
-	MsgTypeBufferReady       = "buffer_ready"
-	MsgTypeKickUser          = "kick_user"
-	MsgTypeTransferHost      = "transfer_host"
-	MsgTypePing              = "ping"
-	MsgTypeRequestSync       = "request_sync"
-	MsgTypeReconnect         = "reconnect"
-	MsgTypeSuggestTrack      = "suggest_track"
-	MsgTypeApproveSuggestion = "approve_suggestion"
-	MsgTypeRejectSuggestion  = "reject_suggestion"
+	MsgTypeCreateRoom         = "create_room"
+	MsgTypeJoinRoom           = "join_room"
+	MsgTypeLeaveRoom          = "leave_room"
+	MsgTypeApproveJoin        = "approve_join"
+	MsgTypeRejectJoin         = "reject_join"
+	MsgTypePlaybackAction     = "playback_action"
+	MsgTypeBufferReady        = "buffer_ready"
+	MsgTypeKickUser           = "kick_user"
+	MsgTypeTransferHost       = "transfer_host"
+	MsgTypePing               = "ping"
+	MsgTypeRequestSync        = "request_sync"
+	MsgTypeReconnect          = "reconnect"
+	MsgTypeSuggestTrack       = "suggest_track"
+	MsgTypeApproveSuggestion  = "approve_suggestion"
+	MsgTypeRejectSuggestion   = "reject_suggestion"
+	MsgTypeClientCapabilities = "client_capabilities"
 
 	// Server -> Client
 	MsgTypeRoomCreated        = "room_created"
@@ -59,6 +62,7 @@ const (
 	MsgTypeSuggestionReceived = "suggestion_received"
 	MsgTypeSuggestionApproved = "suggestion_approved"
 	MsgTypeSuggestionRejected = "suggestion_rejected"
+	MsgTypeServerCapabilities = "server_capabilities"
 )
 
 // Playback actions
@@ -271,6 +275,18 @@ type ReconnectPayload struct {
 	SessionToken string `json:"session_token"`
 }
 
+type ClientCapabilitiesPayload struct {
+	SupportsProtobuf    bool   `json:"supports_protobuf"`
+	SupportsCompression bool   `json:"supports_compression"`
+	ClientVersion       string `json:"client_version"`
+}
+
+type ServerCapabilitiesPayload struct {
+	SupportsProtobuf    bool   `json:"supports_protobuf"`
+	SupportsCompression bool   `json:"supports_compression"`
+	ServerVersion       string `json:"server_version"`
+}
+
 // ReconnectedPayload is sent when successfully reconnected
 type ReconnectedPayload struct {
 	RoomCode string     `json:"room_code"`
@@ -302,15 +318,101 @@ type Session struct {
 
 // Client represents a connected WebSocket client
 type Client struct {
-	ID           string
-	Username     string
-	SessionToken string
-	Conn         *websocket.Conn
-	Room         *Room
-	Send         chan []byte
-	closed       bool
-	mu           sync.Mutex
-	codec        *MessageCodec // Message codec for encoding/decoding
+	id               atomic.Value // string
+	username         atomic.Value // string
+	sessionToken     atomic.Value // string
+	room             atomic.Pointer[Room]
+	Conn             *websocket.Conn
+	Send             chan []byte
+	closed           bool
+	rateWindowStart  time.Time
+	rateMessageCount int
+	mu               sync.Mutex
+	codec            *MessageCodec // Message codec for encoding/decoding
+}
+
+func newClient(id string, conn *websocket.Conn) *Client {
+	c := &Client{
+		Conn:  conn,
+		Send:  make(chan []byte, 256),
+		codec: NewMessageCodec(true),
+	}
+	c.setClientID(id)
+	return c
+}
+
+func loadAtomicString(v *atomic.Value) string {
+	raw := v.Load()
+	if raw == nil {
+		return ""
+	}
+	return raw.(string)
+}
+
+func (c *Client) clientID() string {
+	return loadAtomicString(&c.id)
+}
+
+func (c *Client) setClientID(id string) {
+	c.id.Store(id)
+}
+
+func (c *Client) userName() string {
+	return loadAtomicString(&c.username)
+}
+
+func (c *Client) setUsername(username string) {
+	c.username.Store(username)
+}
+
+func (c *Client) session() string {
+	return loadAtomicString(&c.sessionToken)
+}
+
+func (c *Client) setSessionToken(token string) {
+	c.sessionToken.Store(token)
+}
+
+func (c *Client) currentRoom() *Room {
+	return c.room.Load()
+}
+
+func (c *Client) setRoom(room *Room) {
+	c.room.Store(room)
+}
+
+func (c *Client) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
+}
+
+func (c *Client) closeSend() {
+	c.mu.Lock()
+	if !c.closed {
+		c.closed = true
+		if c.Send != nil {
+			close(c.Send)
+		}
+	}
+	c.mu.Unlock()
+}
+
+func (c *Client) allowMessage(now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.rateWindowStart.IsZero() || now.Sub(c.rateWindowStart) >= MessageRateWindow {
+		c.rateWindowStart = now
+		c.rateMessageCount = 0
+	}
+
+	if c.rateMessageCount >= MaxMessagesPerWindow {
+		return false
+	}
+
+	c.rateMessageCount++
+	return true
 }
 
 // Room represents a listening room
@@ -363,16 +465,27 @@ const (
 	// Minimum time to keep empty rooms after server restart (for reconnection)
 	MinRoomRetentionAfterRestart = 2 * time.Minute
 	// Security limits
-	MaxUsernameLength    = 50
-	MaxRoomCodeLength    = 10
-	MaxTrackTitleLength  = 200
-	MaxTrackArtistLength = 200
-	MaxQueueSize         = 1000
+	MaxUsernameLength     = 50
+	MaxRoomCodeLength     = 10
+	MaxTrackTitleLength   = 200
+	MaxTrackArtistLength  = 200
+	MaxTrackURLLength     = 2048
+	MaxTrackDuration      = 24 * 60 * 60 * 1000 // 24 hours in milliseconds
+	MaxQueueSize          = 1000
+	MaxPendingJoins       = 100
+	MaxPendingSuggestions = 100
 	// Connection limits
-	MaxReadMessageSize = 524288 // 512KB (reasonable for queue syncs)
-	ReadTimeout        = 60 * time.Second
-	WriteTimeout       = 10 * time.Second
-	IdleTimeout        = 120 * time.Second
+	MaxClients           = 10000
+	MaxRooms             = 10000
+	MaxClientsPerRoom    = 100
+	MaxReadMessageSize   = 524288 // 512KB (reasonable for queue syncs)
+	MaxHeaderBytes       = 65536
+	ReadTimeout          = 60 * time.Second
+	WriteTimeout         = 10 * time.Second
+	IdleTimeout          = 120 * time.Second
+	ShutdownTimeout      = 10 * time.Second
+	MessageRateWindow    = time.Second
+	MaxMessagesPerWindow = 60
 )
 
 func NewServer(logger *zap.Logger) *Server {
@@ -383,7 +496,7 @@ func NewServer(logger *zap.Logger) *Server {
 		userAgents: make(map[string]int),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
-				return true // Allow all origins for mobile app
+				return true
 			},
 			ReadBufferSize:  4096,
 			WriteBufferSize: 4096,
@@ -405,77 +518,110 @@ func (s *Server) cleanupExpiredSessions() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		now := time.Now()
-		minRetentionTime := s.startTime.Add(MinRoomRetentionAfterRestart)
+		s.cleanupExpiredSessionsOnce(time.Now())
+	}
+}
 
-		// First, determine which sessions have expired without holding any room locks.
-		s.mu.Lock()
-		expired := make([]*Session, 0)
-		for token, session := range s.sessions {
-			if now.Sub(session.DisconnectAt) > ReconnectGracePeriod {
-				expired = append(expired, session)
-				delete(s.sessions, token)
-				s.logger.Info("Session expired",
-					zap.String("user_id", session.UserID),
-					zap.String("room_code", session.RoomCode))
+func (s *Server) cleanupExpiredSessionsOnce(now time.Time) {
+	minRetentionTime := s.startTime.Add(MinRoomRetentionAfterRestart)
+
+	// First, determine which sessions have expired without holding any room locks.
+	s.mu.Lock()
+	expired := make([]*Session, 0)
+	for token, session := range s.sessions {
+		if now.Sub(session.DisconnectAt) > ReconnectGracePeriod {
+			expired = append(expired, session)
+			delete(s.sessions, token)
+			s.logger.Info("Session expired",
+				zap.String("user_id", session.UserID),
+				zap.String("room_code", session.RoomCode))
+		}
+	}
+	s.mu.Unlock()
+
+	// Now process the side effects for each expired session without
+	// ever taking the server lock and a room lock at the same time.
+	for _, session := range expired {
+		s.mu.RLock()
+		room, exists := s.rooms[session.RoomCode]
+		s.mu.RUnlock()
+		if !exists || room == nil {
+			continue
+		}
+
+		room.mu.Lock()
+
+		delete(room.DisconnectedUsers, session.UserID)
+		expiredWasHost := session.IsHost || room.State.HostID == session.UserID
+
+		// Remove from room state users if still there
+		newUsers := make([]UserInfo, 0, len(room.State.Users))
+		for _, u := range room.State.Users {
+			if u.UserID != session.UserID {
+				newUsers = append(newUsers, u)
 			}
 		}
-		s.mu.Unlock()
+		room.State.Users = newUsers
 
-		// Now process the side effects for each expired session without
-		// ever taking the server lock and a room lock at the same time.
-		for _, session := range expired {
-			s.mu.RLock()
-			room, exists := s.rooms[session.RoomCode]
-			s.mu.RUnlock()
-			if !exists || room == nil {
-				continue
-			}
-
-			room.mu.Lock()
-
-			delete(room.DisconnectedUsers, session.UserID)
-
-			// Remove from room state users if still there
-			newUsers := make([]UserInfo, 0, len(room.State.Users))
-			for _, u := range room.State.Users {
-				if u.UserID != session.UserID {
-					newUsers = append(newUsers, u)
-				}
-			}
-			room.State.Users = newUsers
-
-			// Capture information needed after releasing the room lock
-			shouldDeleteRoom := len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0 && now.After(minRetentionTime)
-			roomCode := room.Code
-			remainingClients := make([]*Client, 0, len(room.Clients))
+		var hostChanged *HostChangedPayload
+		if expiredWasHost {
+			var newHost *Client
 			for _, client := range room.Clients {
 				if client != nil {
-					remainingClients = append(remainingClients, client)
+					newHost = client
+					break
 				}
 			}
-
-			room.mu.Unlock()
-
-			// If the room is now empty and past the retention window, delete it.
-			if shouldDeleteRoom {
-				s.mu.Lock()
-				// Re-check to avoid races where the room might have been recreated.
-				if currentRoom, exists := s.rooms[roomCode]; exists && currentRoom == room {
-					delete(s.rooms, roomCode)
-					s.logger.Info("Deleted empty room",
-						zap.String("room_code", roomCode))
+			room.Host = newHost
+			room.HostDisconnectedAt = nil
+			if newHost != nil {
+				newHostID := newHost.clientID()
+				room.State.HostID = newHostID
+				for i := range room.State.Users {
+					room.State.Users[i].IsHost = room.State.Users[i].UserID == newHostID
 				}
-				s.mu.Unlock()
-				continue
+				hostChanged = &HostChangedPayload{
+					NewHostID:   newHostID,
+					NewHostName: newHost.userName(),
+				}
+			} else {
+				room.State.HostID = ""
 			}
+		}
 
-			// Notify remaining users that the expired session permanently left.
-			for _, client := range remainingClients {
-				client.sendMessage(s.logger, MsgTypeUserLeft, UserLeftPayload{
-					UserID:   session.UserID,
-					Username: session.Username,
-				})
+		// Capture information needed after releasing the room lock
+		shouldDeleteRoom := len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0 && now.After(minRetentionTime)
+		roomCode := room.Code
+		remainingClients := make([]*Client, 0, len(room.Clients))
+		for _, client := range room.Clients {
+			if client != nil {
+				remainingClients = append(remainingClients, client)
+			}
+		}
+
+		room.mu.Unlock()
+
+		// If the room is now empty and past the retention window, delete it.
+		if shouldDeleteRoom {
+			s.mu.Lock()
+			// Re-check to avoid races where the room might have been recreated.
+			if currentRoom, exists := s.rooms[roomCode]; exists && currentRoom == room {
+				delete(s.rooms, roomCode)
+				s.logger.Info("Deleted empty room",
+					zap.String("room_code", roomCode))
+			}
+			s.mu.Unlock()
+			continue
+		}
+
+		// Notify remaining users that the expired session permanently left.
+		for _, client := range remainingClients {
+			client.sendMessage(s.logger, MsgTypeUserLeft, UserLeftPayload{
+				UserID:   session.UserID,
+				Username: session.Username,
+			})
+			if hostChanged != nil {
+				client.sendMessage(s.logger, MsgTypeHostChanged, *hostChanged)
 			}
 		}
 	}
@@ -563,6 +709,14 @@ func (s *Server) generateSessionToken() string {
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	clientCount := len(s.clients)
+	s.mu.RUnlock()
+	if clientCount >= MaxClients {
+		http.Error(w, "server at connection capacity", http.StatusServiceUnavailable)
+		return
+	}
+
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.logger.Warn("WebSocket upgrade error", zap.Error(err))
@@ -578,21 +732,21 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Use Protobuf codec with compression enabled
-	client := &Client{
-		ID:    s.generateUserID(),
-		Conn:  conn,
-		Send:  make(chan []byte, 256),
-		codec: NewMessageCodec(true),
-	}
+	client := newClient(s.generateUserID(), conn)
 
 	s.mu.Lock()
+	if len(s.clients) >= MaxClients {
+		s.mu.Unlock()
+		_ = conn.Close()
+		return
+	}
 	s.clients[client] = true
 	s.mu.Unlock()
 
 	go client.writePump(s.logger)
 	go client.readPump(s)
 
-	s.logger.Info("Client connected", zap.String("client_id", client.ID))
+	s.logger.Info("Client connected", zap.String("client_id", client.clientID()))
 }
 
 func (c *Client) writePump(logger *zap.Logger) {
@@ -607,7 +761,7 @@ func (c *Client) writePump(logger *zap.Logger) {
 		select {
 		case message, ok := <-c.Send:
 			if err := c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
-				logger.Debug("Failed to set write deadline", zap.String("client_id", c.ID), zap.Error(err))
+				logger.Debug("Failed to set write deadline", zap.String("client_id", c.clientID()), zap.Error(err))
 				return
 			}
 			if !ok {
@@ -616,13 +770,13 @@ func (c *Client) writePump(logger *zap.Logger) {
 			}
 
 			if err := c.Conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
-				logger.Debug("Write error for client", zap.String("client_id", c.ID), zap.Error(err))
+				logger.Debug("Write error for client", zap.String("client_id", c.clientID()), zap.Error(err))
 				return
 			}
 
 		case <-ticker.C:
 			if err := c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
-				logger.Debug("Failed to set write deadline", zap.String("client_id", c.ID), zap.Error(err))
+				logger.Debug("Failed to set write deadline", zap.String("client_id", c.clientID()), zap.Error(err))
 				return
 			}
 			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
@@ -640,11 +794,11 @@ func (c *Client) readPump(s *Server) {
 
 	c.Conn.SetReadLimit(MaxReadMessageSize)
 	if err := c.Conn.SetReadDeadline(time.Now().Add(ReadTimeout)); err != nil {
-		s.logger.Debug("Failed to set read deadline", zap.String("client_id", c.ID), zap.Error(err))
+		s.logger.Debug("Failed to set read deadline", zap.String("client_id", c.clientID()), zap.Error(err))
 	}
 	c.Conn.SetPongHandler(func(string) error {
 		if err := c.Conn.SetReadDeadline(time.Now().Add(ReadTimeout)); err != nil {
-			s.logger.Debug("Failed to set read deadline in pong handler", zap.String("client_id", c.ID), zap.Error(err))
+			s.logger.Debug("Failed to set read deadline in pong handler", zap.String("client_id", c.clientID()), zap.Error(err))
 		}
 		return nil
 	})
@@ -653,12 +807,20 @@ func (c *Client) readPump(s *Server) {
 		_, message, err := c.Conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				s.logger.Debug("Read error for client", zap.String("client_id", c.ID), zap.Error(err))
+				s.logger.Debug("Read error for client", zap.String("client_id", c.clientID()), zap.Error(err))
 			}
 			break
 		}
 
-		c.Conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		if !c.allowMessage(time.Now()) {
+			c.sendError(s.logger, "rate_limited", "Too many messages")
+			continue
+		}
+
+		if err := c.Conn.SetReadDeadline(time.Now().Add(ReadTimeout)); err != nil {
+			s.logger.Debug("Failed to refresh read deadline", zap.String("client_id", c.clientID()), zap.Error(err))
+			break
+		}
 		s.handleMessage(c, message)
 	}
 }
@@ -668,64 +830,81 @@ func (s *Server) removeClient(c *Client) {
 	delete(s.clients, c)
 	s.mu.Unlock()
 
-	if c.Room != nil {
+	if c.currentRoom() != nil {
 		s.handleClientDisconnect(c)
+	} else {
+		s.removePendingJoin(c)
 	}
 
-	// Mark client as closed and close the channel
-	c.mu.Lock()
-	if !c.closed {
-		c.closed = true
-		close(c.Send)
-	}
-	c.mu.Unlock()
+	c.closeSend()
 
-	s.logger.Info("Client disconnected", zap.String("client_id", c.ID))
+	s.logger.Info("Client disconnected", zap.String("client_id", c.clientID()))
+}
+
+func (s *Server) removePendingJoin(c *Client) {
+	clientID := c.clientID()
+	if clientID == "" {
+		return
+	}
+
+	s.mu.RLock()
+	rooms := make([]*Room, 0, len(s.rooms))
+	for _, room := range s.rooms {
+		rooms = append(rooms, room)
+	}
+	s.mu.RUnlock()
+
+	for _, room := range rooms {
+		room.mu.Lock()
+		if pending, exists := room.PendingJoins[clientID]; exists && pending == c {
+			delete(room.PendingJoins, clientID)
+		}
+		room.mu.Unlock()
+	}
 }
 
 // handleClientDisconnect handles a client disconnecting - creates a session for reconnection
 func (s *Server) handleClientDisconnect(c *Client) {
-	if c.Room == nil {
+	room := c.currentRoom()
+	if room == nil {
 		return
 	}
 
-	room := c.Room
+	clientID := c.clientID()
+	username := c.userName()
+	sessionToken := c.session()
+	if sessionToken == "" {
+		sessionToken = s.generateSessionToken()
+		c.setSessionToken(sessionToken)
+	}
+
 	room.mu.Lock()
 
 	wasHost := room.Host == c
-	username := c.Username
 
 	// Create session for reconnection
 	session := &Session{
-		UserID:       c.ID,
-		Username:     c.Username,
+		UserID:       clientID,
+		Username:     username,
 		RoomCode:     room.Code,
 		IsHost:       wasHost,
 		DisconnectAt: time.Now(),
 	}
 
-	// Generate session token if not already present
-	if c.SessionToken == "" {
-		c.SessionToken = s.generateSessionToken()
-	}
-
-	// Store the session
-	s.mu.Lock()
-	s.sessions[c.SessionToken] = session
-	s.mu.Unlock()
-
 	// Remove from active clients but add to disconnected users
-	delete(room.Clients, c.ID)
-	delete(room.BufferingUsers, c.ID)
+	delete(room.Clients, clientID)
+	if room.BufferingUsers != nil {
+		delete(room.BufferingUsers, clientID)
+	}
 
 	if room.DisconnectedUsers == nil {
 		room.DisconnectedUsers = make(map[string]*Session)
 	}
-	room.DisconnectedUsers[c.ID] = session
+	room.DisconnectedUsers[clientID] = session
 
 	// Mark user as disconnected in room state
 	for i := range room.State.Users {
-		if room.State.Users[i].UserID == c.ID {
+		if room.State.Users[i].UserID == clientID {
 			room.State.Users[i].IsConnected = false
 			break
 		}
@@ -737,7 +916,7 @@ func (s *Server) handleClientDisconnect(c *Client) {
 		room.HostDisconnectedAt = &now
 	}
 
-	c.Room = nil
+	c.setRoom(nil)
 
 	// Collect clients to notify before unlocking
 	clientsToNotify := make([]*Client, 0, len(room.Clients))
@@ -747,32 +926,27 @@ func (s *Server) handleClientDisconnect(c *Client) {
 		}
 	}
 
-	// If room has no active clients and no disconnected users, mark it as empty
-	if len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0 {
-		now := time.Now()
-		room.EmptySince = &now
-		room.mu.Unlock()
-		s.logger.Info("Room became empty",
-			zap.String("room_code", room.Code))
-		return
-	}
-
+	room.EmptySince = nil
 	room.mu.Unlock()
+
+	// Store the session without holding the room lock to keep lock ordering consistent.
+	s.mu.Lock()
+	s.sessions[sessionToken] = session
+	s.mu.Unlock()
 
 	// Notify other users about the temporary disconnect
 	for _, client := range clientsToNotify {
 		client.sendMessage(s.logger, MsgTypeUserDisconnected, UserDisconnectedPayload{
-			UserID:   c.ID,
+			UserID:   clientID,
 			Username: username,
 		})
 	}
 
 	s.logger.Info("User temporarily disconnected",
 		zap.String("username", username),
-		zap.String("user_id", c.ID),
+		zap.String("user_id", clientID),
 		zap.String("room_code", room.Code),
-		zap.Bool("was_host", wasHost),
-		zap.String("session_token", c.SessionToken))
+		zap.Bool("was_host", wasHost))
 }
 
 // handleReconnect handles a client trying to reconnect to their room
@@ -785,6 +959,10 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 
 	if p.SessionToken == "" {
 		c.sendError(s.logger, "missing_session_token", "Session token is required")
+		return
+	}
+	if c.currentRoom() != nil {
+		c.sendError(s.logger, "already_in_room", "Leave the current room before reconnecting")
 		return
 	}
 
@@ -821,42 +999,73 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 	room.mu.Lock()
 
 	// Restore the client
-	c.ID = session.UserID
-	c.Username = session.Username
-	c.SessionToken = p.SessionToken
-	c.Room = room
+	c.setClientID(session.UserID)
+	c.setUsername(session.Username)
+	c.setSessionToken(p.SessionToken)
+	c.setRoom(room)
 
 	// Add back to room clients
-	room.Clients[c.ID] = c
-	delete(room.DisconnectedUsers, c.ID)
+	room.Clients[session.UserID] = c
+	delete(room.DisconnectedUsers, session.UserID)
 	room.EmptySince = nil
 
 	// Mark user as connected in room state
 	for i := range room.State.Users {
-		if room.State.Users[i].UserID == c.ID {
+		if room.State.Users[i].UserID == session.UserID {
 			room.State.Users[i].IsConnected = true
 			break
 		}
 	}
 
 	// Restore host status if they were the host
-	if session.IsHost && room.HostDisconnectedAt != nil {
+	if session.IsHost {
 		room.Host = c
 		room.HostDisconnectedAt = nil
 
 		// Update IsHost flag in users list
 		for i := range room.State.Users {
-			room.State.Users[i].IsHost = room.State.Users[i].UserID == c.ID
+			room.State.Users[i].IsHost = room.State.Users[i].UserID == session.UserID
 		}
 	}
 
 	// Calculate live position for reconnect state
 	nowMs := time.Now().UnixMilli()
-	liveState := *room.State
+	liveState := cloneRoomState(room.State)
 	liveState.Position = livePlaybackPosition(room.State, nowMs)
 	liveState.LastUpdate = nowMs
 
 	isHost := room.Host == c
+	pendingJoinRequests := make([]JoinRequestPayload, 0, len(room.PendingJoins))
+	pendingSuggestions := make([]SuggestionReceivedPayload, 0, len(room.PendingSuggestions))
+	if isHost {
+		for _, pendingClient := range room.PendingJoins {
+			if pendingClient == nil || pendingClient.isClosed() {
+				continue
+			}
+			pendingJoinRequests = append(pendingJoinRequests, JoinRequestPayload{
+				UserID:   pendingClient.clientID(),
+				Username: pendingClient.userName(),
+			})
+		}
+		for _, suggestion := range room.PendingSuggestions {
+			if suggestion == nil {
+				continue
+			}
+			pendingSuggestions = append(pendingSuggestions, SuggestionReceivedPayload{
+				SuggestionID: suggestion.ID,
+				FromUserID:   suggestion.FromUserID,
+				FromUsername: suggestion.FromUsername,
+				TrackInfo:    cloneTrackInfo(suggestion.Track),
+			})
+		}
+	}
+
+	clientsToNotify := make([]*Client, 0, len(room.Clients))
+	for _, client := range room.Clients {
+		if client != nil && client != c {
+			clientsToNotify = append(clientsToNotify, client)
+		}
+	}
 
 	room.mu.Unlock()
 
@@ -868,52 +1077,38 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 	// Send reconnected message to the client with LIVE state
 	c.sendMessage(s.logger, MsgTypeReconnected, ReconnectedPayload{
 		RoomCode: room.Code,
-		UserID:   c.ID,
-		State:    &liveState,
+		UserID:   c.clientID(),
+		State:    liveState,
 		IsHost:   isHost,
 	})
 
 	if isHost {
-		room.mu.RLock()
-		pendingJoinRequests := make([]JoinRequestPayload, 0, len(room.PendingJoins))
-		for _, pendingClient := range room.PendingJoins {
-			if pendingClient == nil {
-				continue
-			}
-			pendingJoinRequests = append(pendingJoinRequests, JoinRequestPayload{
-				UserID:   pendingClient.ID,
-				Username: pendingClient.Username,
-			})
-		}
-		room.mu.RUnlock()
-
 		for _, joinRequest := range pendingJoinRequests {
 			c.sendMessage(s.logger, MsgTypeJoinRequest, joinRequest)
+		}
+		for _, suggestion := range pendingSuggestions {
+			c.sendMessage(s.logger, MsgTypeSuggestionReceived, suggestion)
 		}
 
 		if len(pendingJoinRequests) > 0 {
 			s.logger.Info("Replayed pending join requests to reconnected host",
-				zap.String("host_id", c.ID),
+				zap.String("host_id", c.clientID()),
 				zap.String("room_code", room.Code),
 				zap.Int("pending_count", len(pendingJoinRequests)))
 		}
 	}
 
 	// Notify other users
-	room.mu.RLock()
-	for _, client := range room.Clients {
-		if client != nil && client.ID != c.ID {
-			client.sendMessage(s.logger, MsgTypeUserReconnected, UserReconnectedPayload{
-				UserID:   c.ID,
-				Username: c.Username,
-			})
-		}
+	for _, client := range clientsToNotify {
+		client.sendMessage(s.logger, MsgTypeUserReconnected, UserReconnectedPayload{
+			UserID:   c.clientID(),
+			Username: c.userName(),
+		})
 	}
-	room.mu.RUnlock()
 
 	s.logger.Info("User reconnected",
-		zap.String("username", c.Username),
-		zap.String("user_id", c.ID),
+		zap.String("username", c.userName()),
+		zap.String("user_id", c.clientID()),
 		zap.String("room_code", room.Code),
 		zap.Bool("is_host", isHost))
 }
@@ -950,6 +1145,72 @@ func sanitizeString(s string, maxLen int) string {
 	return s
 }
 
+func sanitizeTrackInfo(track *TrackInfo) bool {
+	if track == nil {
+		return false
+	}
+
+	track.ID = sanitizeString(track.ID, 200)
+	track.Title = sanitizeString(track.Title, MaxTrackTitleLength)
+	track.Artist = sanitizeString(track.Artist, MaxTrackArtistLength)
+	track.Album = sanitizeString(track.Album, MaxTrackArtistLength)
+	track.Thumbnail = sanitizeString(track.Thumbnail, MaxTrackURLLength)
+	track.SuggestedBy = sanitizeString(track.SuggestedBy, MaxUsernameLength)
+
+	if track.ID == "" || track.Title == "" {
+		return false
+	}
+	if track.Duration <= 0 {
+		track.Duration = 180000
+	} else if track.Duration > MaxTrackDuration {
+		track.Duration = MaxTrackDuration
+	}
+
+	return true
+}
+
+func cloneTrackInfo(track *TrackInfo) *TrackInfo {
+	if track == nil {
+		return nil
+	}
+	copyTrack := *track
+	return &copyTrack
+}
+
+func cloneRoomState(state *RoomState) *RoomState {
+	if state == nil {
+		return nil
+	}
+	copyState := *state
+	copyState.CurrentTrack = cloneTrackInfo(state.CurrentTrack)
+	if state.Users != nil {
+		copyState.Users = append([]UserInfo(nil), state.Users...)
+	}
+	if state.Queue != nil {
+		copyState.Queue = append([]TrackInfo(nil), state.Queue...)
+	}
+	return &copyState
+}
+
+func (s *Server) deleteRoomIfEmpty(room *Room) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	currentRoom, exists := s.rooms[room.Code]
+	if !exists || currentRoom != room {
+		return false
+	}
+
+	room.mu.Lock()
+	defer room.mu.Unlock()
+	if len(room.Clients) != 0 || len(room.DisconnectedUsers) != 0 {
+		return false
+	}
+
+	delete(s.rooms, room.Code)
+	return true
+}
+
 func livePlaybackPosition(state *RoomState, nowMs int64) int64 {
 	if state == nil {
 		return 0
@@ -978,7 +1239,7 @@ func (s *Server) handleMessage(c *Client, data []byte) {
 	// Decode message using protobuf codec
 	msgType, payloadBytes, err := c.codec.Decode(data)
 	if err != nil {
-		s.logger.Debug("Invalid message received", zap.String("client_id", c.ID), zap.Error(err))
+		s.logger.Debug("Invalid message received", zap.String("client_id", c.clientID()), zap.Error(err))
 		c.sendError(s.logger, "invalid_message", "Invalid message format")
 		return
 	}
@@ -988,7 +1249,7 @@ func (s *Server) handleMessage(c *Client, data []byte) {
 		return
 	}
 
-	s.logger.Debug("Message received", zap.String("client_id", c.ID), zap.String("message_type", msgType), zap.String("format", "protobuf"))
+	s.logger.Debug("Message received", zap.String("client_id", c.clientID()), zap.String("message_type", msgType), zap.String("format", "protobuf"))
 
 	switch msgType {
 	case MsgTypeCreateRoom:
@@ -1021,9 +1282,28 @@ func (s *Server) handleMessage(c *Client, data []byte) {
 		s.handleApproveSuggestion(c, payloadBytes)
 	case MsgTypeRejectSuggestion:
 		s.handleRejectSuggestion(c, payloadBytes)
+	case MsgTypeClientCapabilities:
+		s.handleClientCapabilities(c, payloadBytes)
 	default:
 		c.sendError(s.logger, "unknown_message_type", fmt.Sprintf("Unknown message type: %s", msgType))
 	}
+}
+
+func (s *Server) handleClientCapabilities(c *Client, payload []byte) {
+	var p ClientCapabilitiesPayload
+	if err := decodePayload(payload, MsgTypeClientCapabilities, &p); err != nil {
+		c.sendError(s.logger, "invalid_payload", "Invalid client capabilities payload")
+		return
+	}
+	if !p.SupportsProtobuf {
+		c.sendError(s.logger, "unsupported_client", "Protobuf support is required")
+		return
+	}
+	c.sendMessage(s.logger, MsgTypeServerCapabilities, ServerCapabilitiesPayload{
+		SupportsProtobuf:    true,
+		SupportsCompression: true,
+		ServerVersion:       "1",
+	})
 }
 
 func (s *Server) handleSuggestTrack(c *Client, payload []byte) {
@@ -1033,7 +1313,8 @@ func (s *Server) handleSuggestTrack(c *Client, payload []byte) {
 		return
 	}
 
-	if c.Room == nil {
+	room := c.currentRoom()
+	if room == nil {
 		c.sendError(s.logger, "not_in_room", "You are not in a room")
 		return
 	}
@@ -1043,52 +1324,64 @@ func (s *Server) handleSuggestTrack(c *Client, payload []byte) {
 		return
 	}
 
-	// Validate and sanitize track info
-	p.TrackInfo.ID = sanitizeString(p.TrackInfo.ID, 200)
-	p.TrackInfo.Title = sanitizeString(p.TrackInfo.Title, MaxTrackTitleLength)
-	p.TrackInfo.Artist = sanitizeString(p.TrackInfo.Artist, MaxTrackArtistLength)
-	p.TrackInfo.Album = sanitizeString(p.TrackInfo.Album, MaxTrackArtistLength)
-
-	if p.TrackInfo.ID == "" || p.TrackInfo.Title == "" {
+	if !sanitizeTrackInfo(p.TrackInfo) {
 		c.sendError(s.logger, "invalid_track_info", "Track must have ID and title")
 		return
 	}
 
-	room := c.Room
+	clientID := c.clientID()
+	username := c.userName()
 	room.mu.Lock()
-	defer room.mu.Unlock()
+
+	if room.Clients[clientID] != c {
+		room.mu.Unlock()
+		c.sendError(s.logger, "not_in_room", "You are not in a room")
+		return
+	}
 
 	// Host cannot suggest to themselves; ignore silently
-	if room.Host != nil && room.Host.ID == c.ID {
+	if room.State.HostID == clientID {
+		room.mu.Unlock()
 		return
 	}
 
 	if room.PendingSuggestions == nil {
 		room.PendingSuggestions = make(map[string]*Suggestion)
 	}
+	if len(room.PendingSuggestions) >= MaxPendingSuggestions {
+		room.mu.Unlock()
+		c.sendError(s.logger, "suggestions_full", "Too many pending suggestions")
+		return
+	}
 
 	// Generate suggestion ID
+	s.rngMu.Lock()
 	sugID := fmt.Sprintf("sug_%d_%d", time.Now().UnixNano(), s.rng.Intn(10000))
+	s.rngMu.Unlock()
 	room.PendingSuggestions[sugID] = &Suggestion{
 		ID:           sugID,
-		FromUserID:   c.ID,
-		FromUsername: c.Username,
+		FromUserID:   clientID,
+		FromUsername: username,
 		Track:        p.TrackInfo,
 	}
 
-	// Notify host
-	if room.Host != nil {
-		room.Host.sendMessage(s.logger, MsgTypeSuggestionReceived, SuggestionReceivedPayload{
-			SuggestionID: sugID,
-			FromUserID:   c.ID,
-			FromUsername: c.Username,
-			TrackInfo:    p.TrackInfo,
-		})
+	host := room.Host
+	hostConnected := host != nil && room.HostDisconnectedAt == nil
+	notification := SuggestionReceivedPayload{
+		SuggestionID: sugID,
+		FromUserID:   clientID,
+		FromUsername: username,
+		TrackInfo:    p.TrackInfo,
+	}
+	room.mu.Unlock()
+
+	if hostConnected {
+		host.sendMessage(s.logger, MsgTypeSuggestionReceived, notification)
 	}
 
 	s.logger.Info("Suggestion received",
 		zap.String("room_code", room.Code),
-		zap.String("from_user", c.Username),
+		zap.String("from_user", username),
 		zap.String("track_id", p.TrackInfo.ID))
 }
 
@@ -1102,14 +1395,14 @@ func (s *Server) handleApproveSuggestion(c *Client, payload []byte) {
 		c.sendError(s.logger, "missing_suggestion_id", "Suggestion ID is required")
 		return
 	}
-	if c.Room == nil {
+	room := c.currentRoom()
+	if room == nil {
 		c.sendError(s.logger, "not_in_room", "You are not in a room")
 		return
 	}
-	room := c.Room
 	room.mu.Lock()
 	defer room.mu.Unlock()
-	if room.Host == nil || room.Host != c {
+	if room.Host == nil || room.Host != c || room.HostDisconnectedAt != nil {
 		c.sendError(s.logger, "not_host", "Only the host can approve suggestions")
 		return
 	}
@@ -1118,9 +1411,6 @@ func (s *Server) handleApproveSuggestion(c *Client, payload []byte) {
 		c.sendError(s.logger, "suggestion_not_found", "Suggestion not found")
 		return
 	}
-
-	// Remove from pending
-	delete(room.PendingSuggestions, p.SuggestionID)
 
 	// Update room state queue: insert next (front of upcoming queue)
 	if suggestion.Track != nil {
@@ -1131,6 +1421,9 @@ func (s *Server) handleApproveSuggestion(c *Client, payload []byte) {
 		suggestion.Track.SuggestedBy = suggestion.FromUsername
 		room.State.Queue = append([]TrackInfo{*suggestion.Track}, room.State.Queue...)
 	}
+
+	// Remove from pending after all validation succeeds.
+	delete(room.PendingSuggestions, p.SuggestionID)
 
 	// Broadcast queue add (insert next) so clients apply immediately
 	qa := PlaybackActionPayload{
@@ -1172,14 +1465,14 @@ func (s *Server) handleRejectSuggestion(c *Client, payload []byte) {
 		c.sendError(s.logger, "missing_suggestion_id", "Suggestion ID is required")
 		return
 	}
-	if c.Room == nil {
+	room := c.currentRoom()
+	if room == nil {
 		c.sendError(s.logger, "not_in_room", "You are not in a room")
 		return
 	}
-	room := c.Room
 	room.mu.Lock()
 	defer room.mu.Unlock()
-	if room.Host == nil || room.Host != c {
+	if room.Host == nil || room.Host != c || room.HostDisconnectedAt != nil {
 		c.sendError(s.logger, "not_host", "Only the host can reject suggestions")
 		return
 	}
@@ -1223,6 +1516,10 @@ func (s *Server) handleCreateRoom(c *Client, payload []byte) {
 		c.sendError(s.logger, "missing_username", "Username is required")
 		return
 	}
+	if c.currentRoom() != nil {
+		c.sendError(s.logger, "already_in_room", "Leave the current room before creating another")
+		return
+	}
 
 	// Sanitize and validate username
 	p.Username = sanitizeString(p.Username, MaxUsernameLength)
@@ -1253,8 +1550,19 @@ func (s *Server) handleCreateRoom(c *Client, payload []byte) {
 		return
 	}
 
-	c.Username = p.Username
-	c.SessionToken = s.generateSessionToken()
+	s.mu.RLock()
+	roomCount := len(s.rooms)
+	s.mu.RUnlock()
+	if roomCount >= MaxRooms {
+		c.sendError(s.logger, "room_limit_reached", "Server is at room capacity")
+		return
+	}
+
+	c.setUsername(p.Username)
+	c.setSessionToken(s.generateSessionToken())
+	clientID := c.clientID()
+	username := c.userName()
+	sessionToken := c.session()
 
 	room := &Room{
 		Code:              code,
@@ -1265,8 +1573,8 @@ func (s *Server) handleCreateRoom(c *Client, payload []byte) {
 		BufferingUsers:    make(map[string]bool),
 		State: &RoomState{
 			RoomCode:   code,
-			HostID:     c.ID,
-			Users:      []UserInfo{{UserID: c.ID, Username: c.Username, IsHost: true, IsConnected: true}},
+			HostID:     clientID,
+			Users:      []UserInfo{{UserID: clientID, Username: username, IsHost: true, IsConnected: true}},
 			IsPlaying:  false,
 			Position:   0,
 			LastUpdate: time.Now().UnixMilli(),
@@ -1275,28 +1583,38 @@ func (s *Server) handleCreateRoom(c *Client, payload []byte) {
 		},
 	}
 
-	room.Clients[c.ID] = c
-	c.Room = room
+	room.Clients[clientID] = c
 
 	s.mu.Lock()
+	if len(s.rooms) >= MaxRooms {
+		s.mu.Unlock()
+		c.sendError(s.logger, "room_limit_reached", "Server is at room capacity")
+		return
+	}
+	if _, exists := s.rooms[code]; exists {
+		s.mu.Unlock()
+		c.sendError(s.logger, "server_error", "Failed to create room")
+		return
+	}
 	s.rooms[code] = room
 	s.mu.Unlock()
+	c.setRoom(room)
 
 	s.logger.Info("About to send RoomCreated response",
 		zap.String("room_code", code),
-		zap.String("client_id", c.ID),
-		zap.String("session_token_len", fmt.Sprintf("%d", len(c.SessionToken))))
+		zap.String("client_id", clientID),
+		zap.Int("session_token_len", len(sessionToken)))
 
 	c.sendMessage(s.logger, MsgTypeRoomCreated, RoomCreatedPayload{
 		RoomCode:     code,
-		UserID:       c.ID,
-		SessionToken: c.SessionToken,
+		UserID:       clientID,
+		SessionToken: sessionToken,
 	})
 
 	s.logger.Info("Room created",
 		zap.String("room_code", code),
-		zap.String("host_name", c.Username),
-		zap.String("host_id", c.ID))
+		zap.String("host_name", username),
+		zap.String("host_id", clientID))
 }
 
 func (s *Server) handleJoinRoom(c *Client, payload []byte) {
@@ -1308,6 +1626,10 @@ func (s *Server) handleJoinRoom(c *Client, payload []byte) {
 
 	if p.Username == "" {
 		c.sendError(s.logger, "missing_username", "Username is required")
+		return
+	}
+	if c.currentRoom() != nil {
+		c.sendError(s.logger, "already_in_room", "Leave the current room before joining another")
 		return
 	}
 
@@ -1339,31 +1661,43 @@ func (s *Server) handleJoinRoom(c *Client, payload []byte) {
 		return
 	}
 
-	c.Username = p.Username
+	c.setUsername(p.Username)
+	clientID := c.clientID()
+	username := c.userName()
 
 	room.mu.Lock()
 	// Check if user is already in the room or pending
-	if _, exists := room.Clients[c.ID]; exists {
+	if _, exists := room.Clients[clientID]; exists {
 		room.mu.Unlock()
 		c.sendError(s.logger, "already_in_room", "You are already in this room")
 		return
 	}
 
-	if _, exists := room.PendingJoins[c.ID]; exists {
+	if _, exists := room.PendingJoins[clientID]; exists {
 		room.mu.Unlock()
 		c.sendError(s.logger, "already_pending", "Your join request is already pending")
 		return
 	}
+	if len(room.Clients) >= MaxClientsPerRoom {
+		room.mu.Unlock()
+		c.sendError(s.logger, "room_full", "Room is full")
+		return
+	}
+	if len(room.PendingJoins) >= MaxPendingJoins {
+		room.mu.Unlock()
+		c.sendError(s.logger, "too_many_pending", "Too many pending join requests")
+		return
+	}
 
 	// Validate room isn't in an invalid state
-	if room.Host == nil {
+	if room.State.HostID == "" {
 		room.mu.Unlock()
 		c.sendError(s.logger, "room_invalid", "Room is no longer valid")
 		return
 	}
 
 	// Add to pending joins
-	room.PendingJoins[c.ID] = c
+	room.PendingJoins[clientID] = c
 	host := room.Host
 	hostConnected := host != nil && room.HostDisconnectedAt == nil
 	room.mu.Unlock()
@@ -1371,19 +1705,19 @@ func (s *Server) handleJoinRoom(c *Client, payload []byte) {
 	// Notify host of join request if host is currently connected.
 	if hostConnected {
 		host.sendMessage(s.logger, MsgTypeJoinRequest, JoinRequestPayload{
-			UserID:   c.ID,
-			Username: c.Username,
+			UserID:   clientID,
+			Username: username,
 		})
 	} else {
 		s.logger.Info("Host unavailable, join request queued",
-			zap.String("username", c.Username),
-			zap.String("user_id", c.ID),
+			zap.String("username", username),
+			zap.String("user_id", clientID),
 			zap.String("room_code", p.RoomCode))
 	}
 
 	s.logger.Info("Join request received",
-		zap.String("username", c.Username),
-		zap.String("user_id", c.ID),
+		zap.String("username", username),
+		zap.String("user_id", clientID),
 		zap.String("room_code", p.RoomCode))
 }
 
@@ -1399,16 +1733,16 @@ func (s *Server) handleApproveJoin(c *Client, payload []byte) {
 		return
 	}
 
-	if c.Room == nil {
+	room := c.currentRoom()
+	if room == nil {
 		c.sendError(s.logger, "not_in_room", "You are not in a room")
 		return
 	}
 
-	room := c.Room
 	room.mu.Lock()
 	defer room.mu.Unlock()
 
-	if room.Host == nil || room.Host != c {
+	if room.Host == nil || room.Host != c || room.HostDisconnectedAt != nil {
 		c.sendError(s.logger, "not_host", "Only the host can approve join requests")
 		return
 	}
@@ -1420,25 +1754,33 @@ func (s *Server) handleApproveJoin(c *Client, payload []byte) {
 	}
 
 	// Verify joining client is still valid
-	if joiningClient == nil {
+	if joiningClient == nil || joiningClient.isClosed() {
 		delete(room.PendingJoins, p.UserID)
 		c.sendError(s.logger, "user_disconnected", "User has disconnected")
 		return
 	}
+	if len(room.Clients) >= MaxClientsPerRoom {
+		c.sendError(s.logger, "room_full", "Room is full")
+		return
+	}
+
+	joiningID := joiningClient.clientID()
+	joiningUsername := joiningClient.userName()
+	joiningToken := s.generateSessionToken()
 
 	// Remove from pending and add to room
 	delete(room.PendingJoins, p.UserID)
-	room.Clients[joiningClient.ID] = joiningClient
-	joiningClient.Room = room
-	joiningClient.SessionToken = s.generateSessionToken()
+	room.Clients[joiningID] = joiningClient
+	joiningClient.setRoom(room)
+	joiningClient.setSessionToken(joiningToken)
 
 	// Clear empty status since room is no longer empty
 	room.EmptySince = nil
 
 	// Update room state
 	room.State.Users = append(room.State.Users, UserInfo{
-		UserID:      joiningClient.ID,
-		Username:    joiningClient.Username,
+		UserID:      joiningID,
+		Username:    joiningUsername,
 		IsHost:      false,
 		IsConnected: true,
 	})
@@ -1446,9 +1788,9 @@ func (s *Server) handleApproveJoin(c *Client, payload []byte) {
 	// Send approval to the joining user
 	joiningClient.sendMessage(s.logger, MsgTypeJoinApproved, JoinApprovedPayload{
 		RoomCode:     room.Code,
-		UserID:       joiningClient.ID,
-		SessionToken: joiningClient.SessionToken,
-		State:        room.State,
+		UserID:       joiningID,
+		SessionToken: joiningToken,
+		State:        cloneRoomState(room.State),
 	})
 
 	// If there is a current track, immediately send buffer-complete + seek (+ play if host is playing)
@@ -1472,17 +1814,17 @@ func (s *Server) handleApproveJoin(c *Client, payload []byte) {
 
 	// Notify all other users
 	for _, client := range room.Clients {
-		if client != nil && client.ID != joiningClient.ID {
+		if client != nil && client.clientID() != joiningID {
 			client.sendMessage(s.logger, MsgTypeUserJoined, UserJoinedPayload{
-				UserID:   joiningClient.ID,
-				Username: joiningClient.Username,
+				UserID:   joiningID,
+				Username: joiningUsername,
 			})
 		}
 	}
 
 	s.logger.Info("User approved to join room",
-		zap.String("username", joiningClient.Username),
-		zap.String("user_id", joiningClient.ID),
+		zap.String("username", joiningUsername),
+		zap.String("user_id", joiningID),
 		zap.String("room_code", room.Code))
 }
 
@@ -1498,16 +1840,16 @@ func (s *Server) handleRejectJoin(c *Client, payload []byte) {
 		return
 	}
 
-	if c.Room == nil {
+	room := c.currentRoom()
+	if room == nil {
 		c.sendError(s.logger, "not_in_room", "You are not in a room")
 		return
 	}
 
-	room := c.Room
 	room.mu.Lock()
 	defer room.mu.Unlock()
 
-	if room.Host == nil || room.Host != c {
+	if room.Host == nil || room.Host != c || room.HostDisconnectedAt != nil {
 		c.sendError(s.logger, "not_host", "Only the host can reject join requests")
 		return
 	}
@@ -1534,8 +1876,8 @@ func (s *Server) handleRejectJoin(c *Client, payload []byte) {
 	})
 
 	s.logger.Info("User rejected from room",
-		zap.String("username", joiningClient.Username),
-		zap.String("user_id", joiningClient.ID),
+		zap.String("username", joiningClient.userName()),
+		zap.String("user_id", joiningClient.clientID()),
 		zap.String("room_code", room.Code))
 }
 
@@ -1551,16 +1893,16 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 		return
 	}
 
-	if c.Room == nil {
+	room := c.currentRoom()
+	if room == nil {
 		c.sendError(s.logger, "not_in_room", "You are not in a room")
 		return
 	}
 
-	room := c.Room
 	room.mu.Lock()
 	defer room.mu.Unlock()
 
-	if room.Host == nil || room.Host != c {
+	if room.Host == nil || room.Host != c || room.HostDisconnectedAt != nil {
 		c.sendError(s.logger, "not_host", "Only the host can control playback")
 		return
 	}
@@ -1627,22 +1969,9 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 			return
 		}
 
-		// Validate and sanitize track info
-		p.TrackInfo.ID = sanitizeString(p.TrackInfo.ID, 200)
-		p.TrackInfo.Title = sanitizeString(p.TrackInfo.Title, MaxTrackTitleLength)
-		p.TrackInfo.Artist = sanitizeString(p.TrackInfo.Artist, MaxTrackArtistLength)
-		p.TrackInfo.Album = sanitizeString(p.TrackInfo.Album, MaxTrackArtistLength)
-
-		if p.TrackInfo.ID == "" || p.TrackInfo.Title == "" {
+		if !sanitizeTrackInfo(p.TrackInfo) {
 			c.sendError(s.logger, "invalid_track_info", "Track must have ID and title")
 			return
-		}
-
-		// Allow 0 or negative duration - some tracks don't have duration metadata initially
-		// Use a default duration of 3 minutes if not provided
-		if p.TrackInfo.Duration <= 0 {
-			p.TrackInfo.Duration = 180000 // 3 minutes in ms
-			s.logger.Debug("Track duration not provided, using default", zap.String("track_id", p.TrackInfo.ID))
 		}
 
 		room.State.CurrentTrack = p.TrackInfo
@@ -1705,13 +2034,7 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 			return
 		}
 
-		// Validate and sanitize track info
-		p.TrackInfo.ID = sanitizeString(p.TrackInfo.ID, 200)
-		p.TrackInfo.Title = sanitizeString(p.TrackInfo.Title, MaxTrackTitleLength)
-		p.TrackInfo.Artist = sanitizeString(p.TrackInfo.Artist, MaxTrackArtistLength)
-		p.TrackInfo.Album = sanitizeString(p.TrackInfo.Album, MaxTrackArtistLength)
-
-		if p.TrackInfo.ID == "" || p.TrackInfo.Title == "" {
+		if !sanitizeTrackInfo(p.TrackInfo) {
 			c.sendError(s.logger, "invalid_track_info", "Track must have ID and title")
 			return
 		}
@@ -1761,18 +2084,8 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 			// Validate and sanitize each track in the queue
 			sanitizedQueue := make([]TrackInfo, 0, len(p.Queue))
 			for _, track := range p.Queue {
-				track.ID = sanitizeString(track.ID, 200)
-				track.Title = sanitizeString(track.Title, MaxTrackTitleLength)
-				track.Artist = sanitizeString(track.Artist, MaxTrackArtistLength)
-				track.Album = sanitizeString(track.Album, MaxTrackArtistLength)
-
-				// Skip invalid tracks
-				if track.ID == "" || track.Title == "" {
+				if !sanitizeTrackInfo(&track) {
 					continue
-				}
-
-				if track.Duration <= 0 {
-					track.Duration = 180000 // Default to 3m
 				}
 
 				sanitizedQueue = append(sanitizedQueue, track)
@@ -1804,7 +2117,7 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 	s.logger.Debug("Playback action processed",
 		zap.String("action", p.Action),
 		zap.String("room_code", room.Code),
-		zap.String("host_name", c.Username))
+		zap.String("host_name", c.userName()))
 }
 
 func (s *Server) handleBufferReady(c *Client, payload []byte) {
@@ -1819,26 +2132,28 @@ func (s *Server) handleBufferReady(c *Client, payload []byte) {
 		return
 	}
 
-	if c.Room == nil {
+	room := c.currentRoom()
+	if room == nil {
 		c.sendError(s.logger, "not_in_room", "You are not in a room")
 		return
 	}
 
-	room := c.Room
 	room.mu.Lock()
 	defer room.mu.Unlock()
+	clientID := c.clientID()
+	username := c.userName()
 
 	s.logger.Debug("Buffer ready received",
-		zap.String("username", c.Username),
-		zap.String("user_id", c.ID),
+		zap.String("username", username),
+		zap.String("user_id", clientID),
 		zap.String("track_id", p.TrackID))
 
 	// Mark user as ready
-	delete(room.BufferingUsers, c.ID)
+	delete(room.BufferingUsers, clientID)
 
 	// If buffering is disabled for this room, respond per-client so late buffer_ready still receives SEEK/PLAY
 	if room.BufferingUsers == nil {
-		s.logger.Debug("Buffering disabled for room - per-client ACK", zap.String("room_code", room.Code), zap.String("user_id", c.ID))
+		s.logger.Debug("Buffering disabled for room - per-client ACK", zap.String("room_code", room.Code), zap.String("user_id", clientID))
 		syncPosition := livePlaybackPosition(room.State, time.Now().UnixMilli())
 		syncTrackID := p.TrackID
 		if room.State.CurrentTrack != nil && room.State.CurrentTrack.ID != "" {
@@ -1930,21 +2245,22 @@ func (s *Server) handleKickUser(c *Client, payload []byte) {
 		return
 	}
 
-	if c.Room == nil {
+	room := c.currentRoom()
+	if room == nil {
 		c.sendError(s.logger, "not_in_room", "You are not in a room")
 		return
 	}
 
-	room := c.Room
+	clientID := c.clientID()
 	room.mu.Lock()
 
-	if room.Host == nil || room.Host != c {
+	if room.Host == nil || room.Host != c || room.HostDisconnectedAt != nil {
 		room.mu.Unlock()
 		c.sendError(s.logger, "not_host", "Only the host can kick users")
 		return
 	}
 
-	if p.UserID == c.ID {
+	if p.UserID == clientID {
 		room.mu.Unlock()
 		c.sendError(s.logger, "cannot_kick_self", "You cannot kick yourself")
 		return
@@ -1976,8 +2292,8 @@ func (s *Server) handleKickUser(c *Client, payload []byte) {
 	}
 	room.State.Users = newUsers
 
-	kickedUsername := targetClient.Username
-	targetClient.Room = nil
+	kickedUsername := targetClient.userName()
+	targetClient.setRoom(nil)
 
 	// Collect clients to notify before unlocking
 	clientsToNotify := make([]*Client, 0, len(room.Clients))
@@ -2029,23 +2345,23 @@ func (s *Server) handleTransferHost(c *Client, payload []byte) {
 		return
 	}
 
-	if c.Room == nil {
+	room := c.currentRoom()
+	if room == nil {
 		c.sendError(s.logger, "not_in_room", "You are not in a room")
 		return
 	}
 
-	room := c.Room
 	room.mu.Lock()
 	defer room.mu.Unlock()
 
 	// Only current host can transfer ownership
-	if room.Host == nil || room.Host != c {
+	if room.Host == nil || room.Host != c || room.HostDisconnectedAt != nil {
 		c.sendError(s.logger, "not_host", "Only the host can transfer ownership")
 		return
 	}
 
 	// Cannot transfer to self
-	if p.NewHostID == c.ID {
+	if p.NewHostID == c.clientID() {
 		c.sendError(s.logger, "cannot_transfer_to_self", "You are already the host")
 		return
 	}
@@ -2058,12 +2374,13 @@ func (s *Server) handleTransferHost(c *Client, payload []byte) {
 	}
 
 	// Transfer host role
-	oldHostID := c.ID
-	oldHostName := c.Username
-	newHostName := newHostClient.Username
+	oldHostID := c.clientID()
+	oldHostName := c.userName()
+	newHostID := newHostClient.clientID()
+	newHostName := newHostClient.userName()
 
 	room.Host = newHostClient
-	room.State.HostID = newHostClient.ID
+	room.State.HostID = newHostID
 
 	// Update users list in state
 	for i := range room.State.Users {
@@ -2077,7 +2394,7 @@ func (s *Server) handleTransferHost(c *Client, payload []byte) {
 
 	// Notify all users about the host change
 	hostChangedPayload := HostChangedPayload{
-		NewHostID:   newHostClient.ID,
+		NewHostID:   newHostID,
 		NewHostName: newHostName,
 	}
 
@@ -2094,14 +2411,13 @@ func (s *Server) handleTransferHost(c *Client, payload []byte) {
 }
 
 func (s *Server) handleRequestSync(c *Client) {
-	if c.Room == nil {
+	room := c.currentRoom()
+	if room == nil {
 		c.sendError(s.logger, "not_in_room", "You are not in a room")
 		return
 	}
 
-	room := c.Room
 	room.mu.RLock()
-	defer room.mu.RUnlock()
 
 	// Calculate live position
 	nowMs := time.Now().UnixMilli()
@@ -2114,63 +2430,66 @@ func (s *Server) handleRequestSync(c *Client) {
 	responsePlaying := room.State.IsPlaying
 
 	s.logger.Debug("Sync request received",
-		zap.String("username", c.Username),
-		zap.String("user_id", c.ID),
+		zap.String("username", c.userName()),
+		zap.String("user_id", c.clientID()),
 		zap.Bool("has_track", room.State.CurrentTrack != nil),
 		zap.Bool("server_playing", room.State.IsPlaying),
 		zap.Bool("response_playing", responsePlaying),
 		zap.Int64("position", currentPosition),
 		zap.Int64("elapsed_ms", elapsed))
 
-	c.sendMessage(s.logger, MsgTypeSyncState, SyncStatePayload{
-		CurrentTrack: room.State.CurrentTrack,
+	response := SyncStatePayload{
+		CurrentTrack: cloneTrackInfo(room.State.CurrentTrack),
 		IsPlaying:    responsePlaying,
 		Position:     currentPosition,
 		LastUpdate:   nowMs,
-		Queue:        room.State.Queue,
+		Queue:        append([]TrackInfo(nil), room.State.Queue...),
 		Volume:       room.State.Volume,
-	})
+	}
+	room.mu.RUnlock()
+
+	c.sendMessage(s.logger, MsgTypeSyncState, response)
 }
 
 func (s *Server) leaveRoom(c *Client) {
-	if c.Room == nil {
+	room := c.currentRoom()
+	if room == nil {
 		return
 	}
 
-	room := c.Room
+	clientID := c.clientID()
+	username := c.userName()
+	sessionToken := c.session()
 	room.mu.Lock()
 
-	delete(room.Clients, c.ID)
-	delete(room.BufferingUsers, c.ID)
-	delete(room.PendingJoins, c.ID)
-	delete(room.DisconnectedUsers, c.ID)
+	delete(room.Clients, clientID)
+	delete(room.BufferingUsers, clientID)
+	delete(room.PendingJoins, clientID)
+	delete(room.DisconnectedUsers, clientID)
 
-	// Also remove any session token for this user (intentional leave = no reconnect)
-	if c.SessionToken != "" {
-		s.mu.Lock()
-		delete(s.sessions, c.SessionToken)
-		s.mu.Unlock()
-	}
-
-	username := c.Username
 	wasHost := room.Host == c
 
 	// Update room state users list
 	newUsers := make([]UserInfo, 0, len(room.State.Users))
 	for _, u := range room.State.Users {
-		if u.UserID != c.ID {
+		if u.UserID != clientID {
 			newUsers = append(newUsers, u)
 		}
 	}
 	room.State.Users = newUsers
 
-	c.Room = nil
+	c.setRoom(nil)
 
 	// If room is empty (no active or disconnected users), mark it as empty
 	if len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0 {
 		now := time.Now()
 		room.EmptySince = &now
 		room.mu.Unlock()
+		if sessionToken != "" {
+			s.mu.Lock()
+			delete(s.sessions, sessionToken)
+			s.mu.Unlock()
+		}
 		s.logger.Info("Room became empty",
 			zap.String("room_code", room.Code))
 		return
@@ -2185,11 +2504,11 @@ func (s *Server) leaveRoom(c *Client) {
 		}
 		if newHost != nil {
 			room.Host = newHost
-			room.State.HostID = newHost.ID
+			room.State.HostID = newHost.clientID()
 
 			// Update IsHost flag in users list
 			for i := range room.State.Users {
-				room.State.Users[i].IsHost = room.State.Users[i].UserID == newHost.ID
+				room.State.Users[i].IsHost = room.State.Users[i].UserID == newHost.clientID()
 			}
 		}
 	}
@@ -2205,16 +2524,21 @@ func (s *Server) leaveRoom(c *Client) {
 	hostID := ""
 	hostName := ""
 	if newHost != nil {
-		hostID = newHost.ID
-		hostName = newHost.Username
+		hostID = newHost.clientID()
+		hostName = newHost.userName()
 	}
 
 	room.mu.Unlock()
+	if sessionToken != "" {
+		s.mu.Lock()
+		delete(s.sessions, sessionToken)
+		s.mu.Unlock()
+	}
 
 	// Notify other users
 	for _, client := range clientsToNotify {
 		client.sendMessage(s.logger, MsgTypeUserLeft, UserLeftPayload{
-			UserID:   c.ID,
+			UserID:   clientID,
 			Username: username,
 		})
 
@@ -2228,12 +2552,16 @@ func (s *Server) leaveRoom(c *Client) {
 
 	s.logger.Info("User left room",
 		zap.String("username", username),
-		zap.String("user_id", c.ID),
+		zap.String("user_id", clientID),
 		zap.String("room_code", room.Code),
 		zap.Bool("was_host", wasHost))
 }
 
 func (c *Client) sendMessage(logger *zap.Logger, msgType string, payload interface{}) {
+	if c == nil || c.codec == nil || c.Send == nil {
+		return
+	}
+
 	// Use the client's codec to encode the message
 	msgData, err := c.codec.Encode(msgType, payload)
 	if err != nil {
@@ -2250,7 +2578,7 @@ func (c *Client) sendMessage(logger *zap.Logger, msgType string, payload interfa
 	defer c.mu.Unlock()
 
 	if c.closed {
-		logger.Debug("Attempted to send to closed client", zap.String("client_id", c.ID))
+		logger.Debug("Attempted to send to closed client", zap.String("client_id", c.clientID()))
 		return
 	}
 
@@ -2258,7 +2586,9 @@ func (c *Client) sendMessage(logger *zap.Logger, msgType string, payload interfa
 	case c.Send <- msgData:
 		logger.Debug("Message queued for sending", zap.String("message_type", msgType), zap.Int("size", len(msgData)))
 	default:
-		logger.Debug("Client send buffer full", zap.String("client_id", c.ID))
+		logger.Warn("Client send buffer full; closing slow client", zap.String("client_id", c.clientID()))
+		c.closed = true
+		close(c.Send)
 	}
 }
 
@@ -2267,6 +2597,23 @@ func (c *Client) sendError(logger *zap.Logger, code, message string) {
 		Code:    code,
 		Message: message,
 	})
+}
+
+func (s *Server) closeAllClients() {
+	s.mu.RLock()
+	clients := make([]*Client, 0, len(s.clients))
+	for client := range s.clients {
+		clients = append(clients, client)
+	}
+	s.mu.RUnlock()
+
+	for _, client := range clients {
+		if client == nil || client.Conn == nil {
+			continue
+		}
+		_ = client.Conn.Close()
+		client.closeSend()
+	}
 }
 
 func main() {
@@ -2286,27 +2633,14 @@ func main() {
 		// Continue anyway - not fatal
 	}
 
-	// Set up graceful shutdown
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		<-shutdown
-		logger.Info("Shutdown signal received, saving state...")
-		if err := server.SaveState(); err != nil {
-			logger.Error("Failed to save state", zap.Error(err))
-		}
-		logger.Info("State saved, shutting down")
-		os.Exit(0)
-	}()
-
-	http.HandleFunc("/ws", server.handleWebSocket)
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", server.handleWebSocket)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
-	http.HandleFunc("/uas", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/uas", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		server.mu.RLock()
@@ -2333,13 +2667,44 @@ func main() {
 
 	// Configure HTTP server with timeouts for production
 	httpServer := &http.Server{
-		Addr:         ":" + port,
-		ReadTimeout:  ReadTimeout,
-		WriteTimeout: WriteTimeout,
-		IdleTimeout:  IdleTimeout,
+		Addr:           ":" + port,
+		Handler:        mux,
+		ReadTimeout:    ReadTimeout,
+		WriteTimeout:   WriteTimeout,
+		IdleTimeout:    IdleTimeout,
+		MaxHeaderBytes: MaxHeaderBytes,
 	}
 
+	// Set up graceful shutdown
+	shutdown := make(chan os.Signal, 1)
+	shutdownDone := make(chan struct{})
+	signal.Notify(shutdown, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-shutdown
+		defer close(shutdownDone)
+		signal.Stop(shutdown)
+		logger.Info("Shutdown signal received")
+
+		ctx, cancel := context.WithTimeout(context.Background(), ShutdownTimeout)
+		defer cancel()
+		if err := httpServer.Shutdown(ctx); err != nil {
+			logger.Error("HTTP shutdown failed", zap.Error(err))
+		}
+		server.closeAllClients()
+
+		logger.Info("Saving state")
+		if err := server.SaveState(); err != nil {
+			logger.Error("Failed to save state", zap.Error(err))
+		}
+		logger.Info("Shutdown complete")
+	}()
+
 	if err := httpServer.ListenAndServe(); err != nil {
+		if err == http.ErrServerClosed {
+			<-shutdownDone
+			return
+		}
 		logger.Fatal("Server failed", zap.Error(err))
 	}
 }

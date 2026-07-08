@@ -4,12 +4,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"time"
 
 	"go.uber.org/zap"
 )
 
-const StateFile = "server_state.json"
+const (
+	StateFile        = "server_state.json"
+	MaxStateFileSize = 50 * 1024 * 1024
+)
 
 // PersistentState contains all data that needs to be saved across server restarts
 type PersistentState struct {
@@ -48,56 +52,123 @@ type PersistentSession struct {
 
 // SaveState saves the current server state to disk
 func (s *Server) SaveState() error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
 
 	state := PersistentState{
-		ServerShutdownTime: time.Now(),
+		ServerShutdownTime: now,
 		Rooms:              make([]PersistentRoom, 0),
 		Sessions:           make([]PersistentSession, 0),
 	}
-
-	// Save all rooms
-	for _, room := range s.rooms {
-		room.mu.RLock()
-
-		// Convert pending suggestions
-		pendingSuggestions := make([]PersistentSuggestion, 0, len(room.PendingSuggestions))
-		for _, suggestion := range room.PendingSuggestions {
-			pendingSuggestions = append(pendingSuggestions, PersistentSuggestion{
-				ID:           suggestion.ID,
-				FromUserID:   suggestion.FromUserID,
-				FromUsername: suggestion.FromUsername,
-				Track:        suggestion.Track,
-			})
-		}
-
-		// Get host ID from room state (room.Host can be nil after disconnection)
-		hostID := room.State.HostID
-
-		persistentRoom := PersistentRoom{
-			Code:               room.Code,
-			HostID:             hostID,
-			State:              room.State,
-			DisconnectedUsers:  room.DisconnectedUsers,
-			PendingSuggestions: pendingSuggestions,
-			HostDisconnectedAt: room.HostDisconnectedAt,
-		}
-
-		state.Rooms = append(state.Rooms, persistentRoom)
-		room.mu.RUnlock()
-	}
-
-	// Save all sessions
+	sessions := make(map[string]PersistentSession)
 	for token, session := range s.sessions {
-		state.Sessions = append(state.Sessions, PersistentSession{
+		if token == "" || session == nil {
+			continue
+		}
+		sessions[token] = PersistentSession{
 			Token:        token,
 			UserID:       session.UserID,
 			Username:     session.Username,
 			RoomCode:     session.RoomCode,
 			IsHost:       session.IsHost,
 			DisconnectAt: session.DisconnectAt,
-		})
+		}
+	}
+
+	// Save all rooms
+	for _, room := range s.rooms {
+		room.mu.RLock()
+		stateCopy := cloneRoomState(room.State)
+		if stateCopy == nil {
+			room.mu.RUnlock()
+			continue
+		}
+		for i := range stateCopy.Users {
+			stateCopy.Users[i].IsConnected = false
+		}
+
+		disconnectedUsers := make(map[string]*Session, len(room.DisconnectedUsers)+len(room.Clients))
+		for userID, session := range room.DisconnectedUsers {
+			if session == nil {
+				continue
+			}
+			copySession := *session
+			disconnectedUsers[userID] = &copySession
+		}
+
+		for userID, client := range room.Clients {
+			if client == nil {
+				continue
+			}
+			token := client.session()
+			if token == "" {
+				token = s.generateSessionToken()
+				client.setSessionToken(token)
+			}
+			isHost := room.State.HostID == userID
+			session := &Session{
+				UserID:       userID,
+				Username:     client.userName(),
+				RoomCode:     room.Code,
+				IsHost:       isHost,
+				DisconnectAt: now,
+			}
+			disconnectedUsers[userID] = session
+			sessions[token] = PersistentSession{
+				Token:        token,
+				UserID:       session.UserID,
+				Username:     session.Username,
+				RoomCode:     session.RoomCode,
+				IsHost:       session.IsHost,
+				DisconnectAt: session.DisconnectAt,
+			}
+		}
+
+		// Convert pending suggestions
+		pendingSuggestions := make([]PersistentSuggestion, 0, len(room.PendingSuggestions))
+		for _, suggestion := range room.PendingSuggestions {
+			if suggestion == nil {
+				continue
+			}
+			pendingSuggestions = append(pendingSuggestions, PersistentSuggestion{
+				ID:           suggestion.ID,
+				FromUserID:   suggestion.FromUserID,
+				FromUsername: suggestion.FromUsername,
+				Track:        cloneTrackInfo(suggestion.Track),
+			})
+		}
+
+		// Get host ID from room state (room.Host can be nil after disconnection)
+		hostID := room.State.HostID
+
+		hostDisconnectedAt := room.HostDisconnectedAt
+		if room.State.HostID != "" && room.Clients[room.State.HostID] != nil {
+			shutdownTime := now
+			hostDisconnectedAt = &shutdownTime
+		}
+
+		persistentRoom := PersistentRoom{
+			Code:               room.Code,
+			HostID:             hostID,
+			State:              stateCopy,
+			DisconnectedUsers:  disconnectedUsers,
+			PendingSuggestions: pendingSuggestions,
+			HostDisconnectedAt: hostDisconnectedAt,
+		}
+
+		state.Rooms = append(state.Rooms, persistentRoom)
+		room.mu.RUnlock()
+	}
+
+	tokens := make([]string, 0, len(sessions))
+	for token := range sessions {
+		tokens = append(tokens, token)
+	}
+	sort.Strings(tokens)
+	for _, token := range tokens {
+		state.Sessions = append(state.Sessions, sessions[token])
 	}
 
 	// Marshal to JSON
@@ -106,8 +177,7 @@ func (s *Server) SaveState() error {
 		return fmt.Errorf("marshal state: %w", err)
 	}
 
-	// Write to file
-	if err := os.WriteFile(StateFile, data, 0644); err != nil {
+	if err := writeStateFile(StateFile, data); err != nil {
 		return fmt.Errorf("write state file: %w", err)
 	}
 
@@ -118,12 +188,44 @@ func (s *Server) SaveState() error {
 	return nil
 }
 
+func writeStateFile(path string, data []byte) error {
+	tmp, err := os.CreateTemp(".", path+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if err := tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
 // LoadState loads the server state from disk
 func (s *Server) LoadState() error {
 	// Check if state file exists
-	if _, err := os.Stat(StateFile); os.IsNotExist(err) {
+	info, err := os.Stat(StateFile)
+	if os.IsNotExist(err) {
 		s.logger.Info("No previous state file found, starting fresh")
 		return nil
+	} else if err != nil {
+		return fmt.Errorf("stat state file: %w", err)
+	}
+	if info.Size() > MaxStateFileSize {
+		return fmt.Errorf("state file exceeds %d bytes", MaxStateFileSize)
 	}
 
 	// Read state file
@@ -149,13 +251,27 @@ func (s *Server) LoadState() error {
 
 	// Restore rooms
 	for _, persistentRoom := range state.Rooms {
+		if persistentRoom.State == nil {
+			s.logger.Warn("Skipping restored room without state", zap.String("code", persistentRoom.Code))
+			continue
+		}
+		disconnectedUsers := persistentRoom.DisconnectedUsers
+		if disconnectedUsers == nil {
+			disconnectedUsers = make(map[string]*Session)
+		}
+		if persistentRoom.State != nil {
+			for i := range persistentRoom.State.Users {
+				persistentRoom.State.Users[i].IsConnected = false
+			}
+		}
+
 		room := &Room{
 			Code:               persistentRoom.Code,
-			Host:               nil, // Will be nil initially - user needs to reconnect
+			Host:               nil, // The host pointer is only set when the real client reconnects.
 			Clients:            make(map[string]*Client),
 			PendingJoins:       make(map[string]*Client),
 			PendingSuggestions: make(map[string]*Suggestion),
-			DisconnectedUsers:  persistentRoom.DisconnectedUsers,
+			DisconnectedUsers:  disconnectedUsers,
 			State:              persistentRoom.State,
 			BufferingUsers:     make(map[string]bool),
 			HostDisconnectedAt: persistentRoom.HostDisconnectedAt,
@@ -182,14 +298,10 @@ func (s *Server) LoadState() error {
 			room.HostDisconnectedAt = &newTime
 		}
 
-		// Find and set the host reference
-		hostSession, exists := room.DisconnectedUsers[persistentRoom.HostID]
-		if exists {
-			// Create a placeholder client for the host
-			room.Host = &Client{
-				ID:           hostSession.UserID,
-				Username:     hostSession.Username,
-				SessionToken: "", // Will be set on reconnection
+		if room.HostDisconnectedAt == nil && persistentRoom.HostID != "" {
+			if hostSession, exists := room.DisconnectedUsers[persistentRoom.HostID]; exists && hostSession != nil {
+				hostDisconnectedAt := hostSession.DisconnectAt
+				room.HostDisconnectedAt = &hostDisconnectedAt
 			}
 		}
 
@@ -216,11 +328,6 @@ func (s *Server) LoadState() error {
 	s.logger.Info("State restoration complete",
 		zap.Int("rooms_restored", len(state.Rooms)),
 		zap.Int("sessions_restored", len(state.Sessions)))
-
-	// Delete the state file after successful load
-	if err := os.Remove(StateFile); err != nil {
-		s.logger.Warn("Failed to remove state file", zap.Error(err))
-	}
 
 	return nil
 }

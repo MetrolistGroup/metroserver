@@ -3,11 +3,17 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 
 	pb "github.com/MetrolistGroup/metroserver/proto"
 	"google.golang.org/protobuf/proto"
+)
+
+const (
+	MaxEnvelopeTypeLength = 64
+	MaxDecodedPayloadSize = 1024 * 1024 // 1MB after optional decompression
 )
 
 // MessageCodec handles encoding/decoding of messages using Protocol Buffers
@@ -49,9 +55,6 @@ func (c *MessageCodec) encodeProtobuf(msgType string, payload interface{}) ([]by
 		}
 	}
 
-	// Log uncompressed payload size
-	uncompressedSize := len(payloadBytes)
-
 	// Compress payload if enabled
 	compressed := false
 	if c.compressionEnabled && len(payloadBytes) > 100 {
@@ -73,9 +76,6 @@ func (c *MessageCodec) encodeProtobuf(msgType string, payload interface{}) ([]by
 		return nil, fmt.Errorf("marshal envelope: %w", err)
 	}
 
-	// Log final size information
-	_ = uncompressedSize // Use the variable to avoid unused warning
-
 	return envelopeBytes, nil
 }
 
@@ -89,6 +89,12 @@ func (c *MessageCodec) decodeProtobuf(data []byte) (string, []byte, error) {
 	if err := proto.Unmarshal(data, envelope); err != nil {
 		return "", nil, fmt.Errorf("unmarshal envelope (received %d bytes): %w", len(data), err)
 	}
+	if len(envelope.Type) > MaxEnvelopeTypeLength {
+		return "", nil, fmt.Errorf("message type too long")
+	}
+	if len(envelope.Payload) > MaxReadMessageSize {
+		return "", nil, fmt.Errorf("payload too large")
+	}
 
 	payloadBytes := envelope.Payload
 	if envelope.Compressed {
@@ -97,6 +103,9 @@ func (c *MessageCodec) decodeProtobuf(data []byte) (string, []byte, error) {
 			return "", nil, fmt.Errorf("decompress payload: %w", err)
 		}
 		payloadBytes = decompressed
+	}
+	if len(payloadBytes) > MaxDecodedPayloadSize {
+		return "", nil, fmt.Errorf("decoded payload too large")
 	}
 
 	return envelope.Type, payloadBytes, nil
@@ -127,7 +136,15 @@ func decompressData(data []byte) ([]byte, error) {
 	}
 	defer reader.Close()
 
-	return io.ReadAll(reader)
+	limited := io.LimitReader(reader, MaxDecodedPayloadSize+1)
+	out, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > MaxDecodedPayloadSize {
+		return nil, errors.New("decompressed payload too large")
+	}
+	return out, nil
 }
 
 // toProtoMessage converts Go structs to protobuf messages
@@ -180,6 +197,10 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 		return &pb.RejectSuggestionPayload{SuggestionId: p.SuggestionID, Reason: p.Reason}, nil
 	case *ReconnectPayload:
 		return &pb.ReconnectPayload{SessionToken: p.SessionToken}, nil
+	case *ClientCapabilitiesPayload:
+		return &pb.ClientCapabilities{SupportsProtobuf: p.SupportsProtobuf, SupportsCompression: p.SupportsCompression, ClientVersion: p.ClientVersion}, nil
+	case *ServerCapabilitiesPayload:
+		return &pb.ServerCapabilities{SupportsProtobuf: p.SupportsProtobuf, SupportsCompression: p.SupportsCompression, ServerVersion: p.ServerVersion}, nil
 	case *RoomCreatedPayload:
 		return &pb.RoomCreatedPayload{
 			RoomCode:     p.RoomCode,
@@ -368,6 +389,8 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 			}
 		}
 		return pbPayload, nil
+	case ServerCapabilitiesPayload:
+		return &pb.ServerCapabilities{SupportsProtobuf: p.SupportsProtobuf, SupportsCompression: p.SupportsCompression, ServerVersion: p.ServerVersion}, nil
 
 	default:
 		return nil, fmt.Errorf("unsupported payload type: %T", payload)
@@ -471,6 +494,12 @@ func fromProtoMessage(msgType string, data []byte) (interface{}, error) {
 			return nil, err
 		}
 		return &ReconnectPayload{SessionToken: pb.SessionToken}, nil
+	case MsgTypeClientCapabilities:
+		var pb pb.ClientCapabilities
+		if err := proto.Unmarshal(data, &pb); err != nil {
+			return nil, err
+		}
+		return &ClientCapabilitiesPayload{SupportsProtobuf: pb.SupportsProtobuf, SupportsCompression: pb.SupportsCompression, ClientVersion: pb.ClientVersion}, nil
 	default:
 		return nil, fmt.Errorf("unsupported message type: %s", msgType)
 	}
@@ -532,15 +561,11 @@ func roomStateToProto(r *RoomState) *pb.RoomState {
 		}
 	}
 
-	// Always initialize queue as non-nil (proto3 repeated fields should not be nil)
 	if r.Queue != nil && len(r.Queue) > 0 {
 		pbState.Queue = make([]*pb.TrackInfo, len(r.Queue))
 		for i, track := range r.Queue {
 			pbState.Queue[i] = trackInfoToProto(&track)
 		}
-	} else {
-		// Explicitly set to empty slice, not nil
-		pbState.Queue = []*pb.TrackInfo{}
 	}
 
 	return pbState
@@ -626,6 +651,12 @@ func decodePayload(payloadBytes []byte, msgType string, target interface{}) erro
 		p, ok := payload.(*TransferHostPayload)
 		if !ok {
 			return fmt.Errorf("payload type mismatch: expected TransferHostPayload, got %T", payload)
+		}
+		*t = *p
+	case *ClientCapabilitiesPayload:
+		p, ok := payload.(*ClientCapabilitiesPayload)
+		if !ok {
+			return fmt.Errorf("payload type mismatch: expected ClientCapabilitiesPayload, got %T", payload)
 		}
 		*t = *p
 	default:
