@@ -11,7 +11,7 @@ WORKDIR /build
 COPY go.mod go.sum ./
 
 # Download Go protobuf plugins
-RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@latest && \
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11 && \
     go mod download
 
 # Ensure protoc-gen-go is on PATH
@@ -21,10 +21,10 @@ ENV PATH="/root/go/bin:${PATH}"
 COPY . .
 
 # Generate protobuf files from submodule
-RUN bash generate_proto.sh
+RUN bash scripts/generate_proto.sh
 
 # Build the application
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o main -ldflags="-w -s" .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o metroserver -ldflags="-w -s" ./cmd/metroserver
 
 # Final stage - minimal runtime image
 FROM alpine:3.20
@@ -40,7 +40,7 @@ RUN addgroup -g 1000 metrolist && \
 WORKDIR /app
 
 # Copy binary from builder
-COPY --from=builder /build/main .
+COPY --from=builder /build/metroserver .
 
 # Change ownership to non-root user
 RUN chown -R metrolist:metrolist /app
@@ -57,4 +57,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 
 # Run the application
 # PORT can be overridden at runtime using -e PORT=<port>
-CMD ["./main"]
+CMD ["./metroserver"]

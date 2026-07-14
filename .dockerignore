@@ -1,7 +1,7 @@
 .git
 .github
 .gitignore
-main
+/metroserver
 README.md
 LICENSE
 .DS_Store

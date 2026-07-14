@@ -15,20 +15,19 @@ git clone https://github.com/MetrolistGroup/metroserver
 cd metroserver
 
 # Generate protobuf files (required first time)
-chmod +x generate_proto.sh
-./generate_proto.sh
+./scripts/generate_proto.sh
 
 # Download dependencies
 go mod download
 
 # Build the server
-go build -o main .
+go build -o metroserver ./cmd/metroserver
 
 # Run on default port 8080
-./main
+./metroserver
 
 # Run on custom port
-PORT=9000 ./main
+PORT=9000 ./metroserver
 ```
 
 ## Configuration
@@ -36,6 +35,14 @@ PORT=9000 ./main
 `PORT` sets the HTTP/WebSocket port. It defaults to `8080`.
 
 The server writes graceful-shutdown recovery state to `server_state.json` with `0600` permissions.
+
+## Project Structure
+
+- `cmd/metroserver` contains the executable entrypoint.
+- `internal/server` contains server behavior and tests.
+- `metroproto` contains the protobuf schema submodule.
+- `proto` contains generated Go protobuf code.
+- `scripts` contains development and generation scripts.
 
 ## Docker
 

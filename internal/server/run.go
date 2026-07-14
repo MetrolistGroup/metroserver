@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 	"go.uber.org/zap"
 )
 
-func main() {
+func Run() {
 	// Initialize logger
 	logger, err := zap.NewProduction()
 	if err != nil {

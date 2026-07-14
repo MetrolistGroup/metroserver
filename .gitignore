@@ -1,5 +1,5 @@
-main
+/main
 proto/listentogether.pb.go
-metroserver
+/metroserver
 server_state.json
 coverage.out

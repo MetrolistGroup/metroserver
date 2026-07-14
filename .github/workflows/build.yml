@@ -32,8 +32,21 @@ jobs:
                   go-version: "1.25.6"
                   cache: true
 
+            - name: Install protoc
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y protobuf-compiler
+
+            - name: Install protoc-gen-go
+              run: |
+                  go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+                  echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+            - name: Generate protobuf files
+              run: bash scripts/generate_proto.sh
+
             - name: Run tests with coverage
-              run: go test -race -covermode=atomic -coverprofile=coverage.out .
+              run: go test -race -covermode=atomic -coverprofile=coverage.out ./internal/server
 
             - name: Enforce 80% coverage
               run: |
@@ -113,24 +126,24 @@ jobs:
                   sudo apt-get update
                   sudo apt-get install -y protobuf-compiler
 
-            - name: Install protoc-gen-go plugins
+            - name: Install protoc-gen-go
               run: |
-                  go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-                  echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+                  go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+                  echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
             - name: Generate protobuf files
-              run: bash generate_proto.sh
+              run: bash scripts/generate_proto.sh
 
             - name: Download dependencies
               run: go mod download
 
             - name: Build
-              run: go build -v -o main .
+              run: go build -v -o metroserver ./cmd/metroserver
 
             - name: Run basic tests
               run: |
                   # Test that the server binary exists and is executable
-                  test -x ./main
+                  test -x ./metroserver
                   echo "✓ Binary built successfully"
 
             - name: Set up Docker Buildx
