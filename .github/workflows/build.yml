@@ -62,6 +62,7 @@ jobs:
                   use_oidc: true
 
     build:
+        needs: test
         runs-on: ubuntu-latest
         permissions:
             contents: read
@@ -107,6 +108,7 @@ jobs:
                   cache-to: type=gha,mode=max
 
     test-build:
+        needs: test
         runs-on: ubuntu-latest
         if: github.event_name == 'pull_request'
 
