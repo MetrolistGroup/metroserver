@@ -52,7 +52,7 @@ const (
 // allowed to host.
 var (
 	defaultAllowUA      = []string{"okhttp", "ktor-client"}
-	defaultAllowUAExact = []string{"com.metrolist.music", "com.metrolist.music.debug", "com.nevar.nzik"}
+	defaultAllowUAExact = []string{"com.metrolist.music", "com.metrolist.music.debug", "com.nevar.nzik", "com.nevar.nzik.debug"}
 )
 
 func rickTrack() TrackInfo {
