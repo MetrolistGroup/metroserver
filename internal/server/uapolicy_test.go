@@ -61,7 +61,7 @@ func TestUAPolicyResolvesTiers(t *testing.T) {
 	}
 }
 
-func TestDefaultUAPolicyAllowlistIsFirstPartyOnly(t *testing.T) {
+func TestDefaultUAPolicyAllowlistUsesExactPackageNames(t *testing.T) {
 	policy := defaultUAPolicy()
 	for _, test := range []struct {
 		userAgent string
@@ -71,6 +71,9 @@ func TestDefaultUAPolicyAllowlistIsFirstPartyOnly(t *testing.T) {
 		{userAgent: "ktor-client/2", want: uaAllow},
 		{userAgent: "com.metrolist.music", want: uaAllow},
 		{userAgent: "com.metrolist.music.debug", want: uaAllow},
+		{userAgent: "com.nevar.nzik", want: uaAllow},
+		{userAgent: "com.nevar.nzik.debug", want: uaAllow},
+		{userAgent: "com.nevar.nzik.evil", want: uaAdvert},
 		{userAgent: "com.joymusic.app", want: uaAdvert},
 		{userAgent: "com.metrolist.musiiz", want: uaAdvert},
 		{userAgent: "com.metrolist.music8", want: uaAdvert},
@@ -122,6 +125,9 @@ func TestLoadUAPolicy(t *testing.T) {
 	}{
 		{userAgent: "okhttp/4.12.0", want: uaAllow},
 		{userAgent: "com.metrolist.music.debug", want: uaAllow},
+		{userAgent: "com.nevar.nzik", want: uaAllow},
+		{userAgent: "com.nevar.nzik.debug", want: uaAllow},
+		{userAgent: "com.nevar.nzik.evil", want: uaAdvert},
 		{userAgent: "com.nestmusic.music", want: uaRickroll},
 		{userAgent: "org.cicada", want: uaAdvert},
 		{userAgent: "com.sporify.lite", want: uaBlock},

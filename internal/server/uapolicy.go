@@ -49,10 +49,10 @@ const (
 
 // Transport User-Agents are substring matches. Package-name User-Agents are
 // exact matches so repacks such as com.metrolist.music8 are not accidentally
-// treated as first-party.
+// allowed to host.
 var (
 	defaultAllowUA      = []string{"okhttp", "ktor-client"}
-	defaultAllowUAExact = []string{"com.metrolist.music", "com.metrolist.music.debug"}
+	defaultAllowUAExact = []string{"com.metrolist.music", "com.metrolist.music.debug", "com.nevar.nzik", "com.nevar.nzik.debug"}
 )
 
 func rickTrack() TrackInfo {
