@@ -43,7 +43,8 @@ curl -H 'Authorization: Bearer replace-me' http://localhost:8080/uas
 
 `UA_POLICY_FILE` points at a JSON User-Agent policy. Without it the server runs
 with built-in defaults: Metrolist, N-Zik (`com.nevar.nzik` and
-`com.nevar.nzik.debug`), and recognized transport User-Agents can host;
+`com.nevar.nzik.debug`), HiFi (`com.hifi.music` and `com.hifi.music.dev`),
+and recognized transport User-Agents can host;
 unmatched clients are served a Metrolist ad as the queue title. See `ua_policy.example.json`.
 
 `DATABASE_FILE` sets the shared bbolt database path and defaults to
