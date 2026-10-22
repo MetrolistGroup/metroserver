@@ -24,10 +24,9 @@ func playbackTestRoom() (*Server, *Client, *Client, *Room) {
 	guest := newClient("guest", nil)
 	guest.setUsername("Guest")
 	room := &Room{
-		Code:           "ROOM1234",
-		Host:           host,
-		Clients:        map[string]*Client{"host": host, "guest": guest},
-		BufferingUsers: make(map[string]bool),
+		Code:    "ROOM1234",
+		Host:    host,
+		Clients: map[string]*Client{"host": host, "guest": guest},
 		State: &RoomState{
 			RoomCode:     "ROOM1234",
 			HostID:       "host",
@@ -72,8 +71,9 @@ func TestPlaybackActionRemainingPositionAndVolumeBranches(t *testing.T) {
 		wantBroadcast int64
 		wantVolume    float64
 	}{
-		{name: "pause clamps", payload: PlaybackActionPayload{Action: ActionPause, Position: 1200}, playing: true, wantPosition: 1000, wantBroadcast: 1000, wantVolume: 0.5},
-		{name: "seek clamps and fills track ID", payload: PlaybackActionPayload{Action: ActionSeek, Position: 1200}, playing: true, wantPosition: 1000, wantBroadcast: 1000, wantVolume: 0.5},
+		{name: "pause past reported duration", payload: PlaybackActionPayload{Action: ActionPause, Position: 1200}, playing: true, wantPosition: 1200, wantBroadcast: 1200, wantVolume: 0.5},
+		{name: "seek fills track ID", payload: PlaybackActionPayload{Action: ActionSeek, Position: 1200}, playing: true, wantPosition: 1200, wantBroadcast: 1200, wantVolume: 0.5},
+		{name: "seek clamps to maximum", payload: PlaybackActionPayload{Action: ActionSeek, Position: MaxTrackDuration + 1}, playing: false, wantPosition: MaxTrackDuration, wantBroadcast: MaxTrackDuration, wantVolume: 0.5},
 		{name: "set volume", payload: PlaybackActionPayload{Action: ActionSetVolume, Volume: 0.75}, playing: false, wantPosition: 0, wantVolume: 0.75},
 	}
 
@@ -81,7 +81,7 @@ func TestPlaybackActionRemainingPositionAndVolumeBranches(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			server, host, guest, room := playbackTestRoom()
 			room.State.IsPlaying = tt.playing
-			before := time.Now().UnixMilli()
+			before := serverNowMs()
 			server.handlePlaybackAction(host, encodeTestPayload(t, MsgTypePlaybackAction, &tt.payload))
 
 			if room.State.Position != tt.wantPosition {
@@ -111,8 +111,7 @@ func TestPlaybackActionRemainingPositionAndVolumeBranches(t *testing.T) {
 func TestPlaybackActionChangeTrackSendsTransitionSequence(t *testing.T) {
 	server, host, guest, room := playbackTestRoom()
 	room.State.IsPlaying = true
-	room.BufferingUsers = map[string]bool{"guest": true}
-	track := &TrackInfo{ID: " next ", Title: " Next Track ", Duration: 2000}
+	track := &TrackInfo{ID: "next", Title: " Next Track ", Duration: 2000}
 
 	server.handlePlaybackAction(host, encodeTestPayload(t, MsgTypePlaybackAction, &PlaybackActionPayload{
 		Action:    ActionChangeTrack,
@@ -122,11 +121,8 @@ func TestPlaybackActionChangeTrackSendsTransitionSequence(t *testing.T) {
 	if room.State.CurrentTrack.ID != "next" || room.State.CurrentTrack.Title != "Next Track" {
 		t.Fatalf("track was not sanitized into state: %#v", room.State.CurrentTrack)
 	}
-	if room.State.Position != 0 || room.State.IsPlaying || room.HostStartPosition != 0 {
+	if room.State.Position != 0 || room.State.IsPlaying || room.TrackRevision != 1 {
 		t.Fatalf("unexpected transition state: %#v", room.State)
-	}
-	if room.BufferingUsers != nil {
-		t.Fatal("track change did not disable buffering tracking")
 	}
 
 	changed := requirePlaybackMessage(t, guest, ActionChangeTrack)
@@ -212,10 +208,11 @@ func TestPlaybackActionQueueMutationsAndSyncSanitization(t *testing.T) {
 	}
 
 	syncQueue := []TrackInfo{
-		{ID: " valid ", Title: " Valid ", Duration: 0},
-		{ID: "valid", Title: "Duplicate", Duration: 10},
+		{ID: "valid", Title: " Valid ", Duration: -5},
+		{ID: "valid", Title: "Repeat", Duration: 10},
 		{ID: "current", Title: "Current track", Duration: 10},
 		{ID: "", Title: "Invalid", Duration: 10},
+		{ID: "bad\x01", Title: "Invalid", Duration: 10},
 	}
 	for i := 0; i < MaxQueueSize; i++ {
 		syncQueue = append(syncQueue, TrackInfo{ID: fmt.Sprintf("bulk-%d", i), Title: "Bulk", Duration: 10})
@@ -225,11 +222,13 @@ func TestPlaybackActionQueueMutationsAndSyncSanitization(t *testing.T) {
 	if len(room.State.Queue) != MaxQueueSize || len(broadcast.Queue) != MaxQueueSize {
 		t.Fatalf("sanitized queue lengths = state %d, broadcast %d, want %d", len(room.State.Queue), len(broadcast.Queue), MaxQueueSize)
 	}
-	if room.State.Queue[0].ID != "valid" || room.State.Queue[0].Duration != 180000 {
+	if room.State.Queue[0].ID != "valid" || room.State.Queue[0].Title != "Valid" || room.State.Queue[0].Duration != 0 {
 		t.Fatalf("first queue item was not sanitized: %#v", room.State.Queue[0])
 	}
-	if containsTrackID(room.State.Queue, "current") {
-		t.Fatal("sync queue retained the current track in the upcoming queue")
+	// The host's queue is mirrored as sent: repeats and a later replay of the
+	// current track are intentional.
+	if got := []string{room.State.Queue[1].ID, room.State.Queue[2].ID}; !reflect.DeepEqual(got, []string{"valid", "current"}) {
+		t.Fatalf("queue = %v, want repeats preserved", got)
 	}
 
 	server.handlePlaybackAction(host, encodeTestPayload(t, MsgTypePlaybackAction, &PlaybackActionPayload{Action: ActionSyncQueue}))
@@ -285,7 +284,7 @@ func TestPlaybackActionValidationErrors(t *testing.T) {
 		"change track missing info": {Action: ActionChangeTrack},
 		"change track invalid info": {Action: ActionChangeTrack, TrackInfo: &TrackInfo{Title: "No ID"}},
 		"queue add missing info":    {Action: ActionQueueAdd},
-		"queue add invalid info":    {Action: ActionQueueAdd, TrackInfo: &TrackInfo{ID: "id"}},
+		"queue add invalid info":    {Action: ActionQueueAdd, TrackInfo: &TrackInfo{ID: "id\x00"}},
 		"queue full":                {Action: ActionQueueAdd, TrackInfo: &TrackInfo{ID: "id", Title: "Title"}},
 		"queue remove missing ID":   {Action: ActionQueueRemove},
 		"volume below range":        {Action: ActionSetVolume, Volume: -0.1},
@@ -322,7 +321,6 @@ func TestBufferReadyDisabledSendsPerClientSync(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			server, _, guest, room := playbackTestRoom()
-			room.BufferingUsers = nil
 			room.State.IsPlaying = tt.playing
 			room.State.Position = 250
 			room.State.LastUpdate = time.Now().Add(time.Hour).UnixMilli()
@@ -349,46 +347,23 @@ func TestBufferReadyDisabledSendsPerClientSync(t *testing.T) {
 	}
 }
 
-func TestBufferReadyEnabledWaitsThenCompletes(t *testing.T) {
-	t.Run("waits for remaining user", func(t *testing.T) {
-		server, host, guest, room := playbackTestRoom()
-		room.BufferingUsers = map[string]bool{"guest": true, "other": true}
-		server.handleBufferReady(guest, encodeTestPayload(t, MsgTypeBufferReady, &BufferReadyPayload{TrackID: "current"}))
+func TestBufferReadyFromHostOnlyCompletes(t *testing.T) {
+	server, host, _, room := playbackTestRoom()
+	room.State.IsPlaying = true
+	room.State.Position = 600
+	server.handleBufferReady(host, encodeTestPayload(t, MsgTypeBufferReady, &BufferReadyPayload{TrackID: "current"}))
 
-		for _, client := range []*Client{host, guest} {
-			var wait pb.BufferWaitPayload
-			if msgType := receiveTestMessage(t, client, &wait); msgType != MsgTypeBufferWait {
-				t.Fatalf("message type = %q, want %q", msgType, MsgTypeBufferWait)
-			}
-			if wait.TrackId != "current" || !reflect.DeepEqual(wait.WaitingFor, []string{"other"}) {
-				t.Fatalf("unexpected wait payload: %#v", &wait)
-			}
-		}
-	})
+	var complete pb.BufferCompletePayload
+	if msgType := receiveTestMessage(t, host, &complete); msgType != MsgTypeBufferComplete || complete.TrackId != "current" {
+		t.Fatalf("host got %q, want only buffer_complete", msgType)
+	}
+}
 
-	t.Run("last user completes and resumes", func(t *testing.T) {
-		server, host, guest, room := playbackTestRoom()
-		room.BufferingUsers = map[string]bool{"guest": true}
-		room.State.IsPlaying = true
-		room.State.Position = 600
-		server.handleBufferReady(guest, encodeTestPayload(t, MsgTypeBufferReady, &BufferReadyPayload{TrackID: "current"}))
-
-		if room.State.Position != 600 || room.State.LastUpdate != 0 {
-			t.Fatalf("unexpected completed buffer state: %#v", room.State)
-		}
-		for _, client := range []*Client{host, guest} {
-			if seek := requirePlaybackMessage(t, client, ActionSeek); seek.TrackId != "current" || seek.Position != 600 {
-				t.Fatalf("unexpected seek: %#v", &seek)
-			}
-			if play := requirePlaybackMessage(t, client, ActionPlay); play.TrackId != "current" || play.Position != 600 {
-				t.Fatalf("unexpected play: %#v", &play)
-			}
-			var complete pb.BufferCompletePayload
-			if msgType := receiveTestMessage(t, client, &complete); msgType != MsgTypeBufferComplete || complete.TrackId != "current" {
-				t.Fatalf("unexpected completion: type=%q payload=%#v", msgType, &complete)
-			}
-		}
-	})
+func TestBufferReadyRejectsStaleTrackRevision(t *testing.T) {
+	server, _, guest, room := playbackTestRoom()
+	room.TrackRevision = 5
+	server.handleBufferReady(guest, encodeTestPayload(t, MsgTypeBufferReady, &BufferReadyPayload{TrackID: "current", TrackRevision: 4}))
+	requireTestError(t, guest, "stale_track")
 }
 
 func TestBufferReadyValidationErrors(t *testing.T) {
@@ -440,7 +415,7 @@ func TestRequestSyncReturnsSnapshotAndLivePosition(t *testing.T) {
 	if msgType := receiveTestMessage(t, guest, &sync); msgType != MsgTypeSyncState {
 		t.Fatalf("message type = %q, want %q", msgType, MsgTypeSyncState)
 	}
-	if sync.CurrentTrack == nil || sync.CurrentTrack.Id != "current" || !sync.IsPlaying || sync.Position != 1000 {
+	if sync.CurrentTrack == nil || sync.CurrentTrack.Id != "current" || !sync.IsPlaying || sync.Position < 1300 || sync.Position > 1500 {
 		t.Fatalf("unexpected sync state: %#v", &sync)
 	}
 	if sync.LastUpdate == 0 || sync.Volume != float32(0.8) || len(sync.Queue) != 1 || sync.Queue[0].Id != "queued" || sync.Revision != 9 {
@@ -549,7 +524,7 @@ func TestPlaybackActionAuthorizesBeforeDecodingQueue(t *testing.T) {
 func TestPlaybackActionSanitizesQueueTitle(t *testing.T) {
 	server, host, guest, _ := playbackTestRoom()
 	server.handlePlaybackAction(host, encodeTestPayload(t, MsgTypePlaybackAction, &PlaybackActionPayload{
-		Action:     ActionQueueClear,
+		Action:     ActionSyncQueue,
 		QueueTitle: strings.Repeat("x", MaxTrackTitleLength+50) + "\x01",
 	}))
 
@@ -597,19 +572,19 @@ func TestHandleMessagePingUnknownInvalidAndDispatch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		server.handleMessage(host, message)
+		server.handleMessage(host, message, serverNowMs())
 		if msgType := receiveTestMessage(t, host, nil); msgType != MsgTypePong {
 			t.Fatalf("message type = %q, want %q", msgType, MsgTypePong)
 		}
 	})
 
 	t.Run("timestamped ping", func(t *testing.T) {
-		before := time.Now().UnixMilli()
+		before := serverNowMs()
 		message, err := codec.Encode(MsgTypePing, PingPayload{ClientTime: 1234, Sequence: 7})
 		if err != nil {
 			t.Fatal(err)
 		}
-		server.handleMessage(host, message)
+		server.handleMessage(host, message, serverNowMs())
 		var pong pb.PongPayload
 		if msgType := receiveTestMessage(t, host, &pong); msgType != MsgTypePong {
 			t.Fatalf("message type = %q, want %q", msgType, MsgTypePong)
@@ -624,12 +599,12 @@ func TestHandleMessagePingUnknownInvalidAndDispatch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		server.handleMessage(host, message)
+		server.handleMessage(host, message, serverNowMs())
 		requireTestError(t, host, "unknown_message_type")
 	})
 
 	t.Run("invalid envelope", func(t *testing.T) {
-		server.handleMessage(host, []byte{0xff})
+		server.handleMessage(host, []byte{0xff}, serverNowMs())
 		requireTestError(t, host, "invalid_message")
 	})
 
@@ -638,7 +613,7 @@ func TestHandleMessagePingUnknownInvalidAndDispatch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		server.handleMessage(host, message)
+		server.handleMessage(host, message, serverNowMs())
 		requireTestError(t, host, "invalid_message")
 	})
 
@@ -647,7 +622,7 @@ func TestHandleMessagePingUnknownInvalidAndDispatch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		server.handleMessage(host, message)
+		server.handleMessage(host, message, serverNowMs())
 		if room.State.Volume != 0.25 {
 			t.Fatalf("dispatched volume = %v, want 0.25", room.State.Volume)
 		}
@@ -666,7 +641,7 @@ func TestClientCapabilitiesResponses(t *testing.T) {
 		if msgType := receiveTestMessage(t, client, &response); msgType != MsgTypeServerCapabilities {
 			t.Fatalf("message type = %q, want %q", msgType, MsgTypeServerCapabilities)
 		}
-		if !response.SupportsProtobuf || !response.SupportsCompression || response.ServerVersion != "1" {
+		if !response.SupportsProtobuf || !response.SupportsCompression || response.ServerVersion != "2" || len(response.Features) != 0 {
 			t.Fatalf("unexpected server capabilities: %#v", &response)
 		}
 	})

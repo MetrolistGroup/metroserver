@@ -7,11 +7,20 @@ import (
 )
 
 func (s *Server) cleanupExpiredSessions() {
-	ticker := time.NewTicker(SessionCleanupInterval)
-	defer ticker.Stop()
+	sessions := time.NewTicker(SessionCleanupInterval)
+	failover := time.NewTicker(HostFailoverCheckInterval)
+	defer sessions.Stop()
+	defer failover.Stop()
 
-	for range ticker.C {
-		s.cleanupExpiredSessionsOnce(time.Now())
+	for {
+		select {
+		case <-s.stop:
+			return
+		case now := <-sessions.C:
+			s.cleanupExpiredSessionsOnce(now)
+		case now := <-failover.C:
+			s.failoverHostsOnce(now)
+		}
 	}
 }
 
@@ -36,8 +45,6 @@ func (s *Server) cleanupExpiredSessionsOnce(now time.Time) {
 	}
 	s.mu.Unlock()
 
-	// Now process the side effects for each expired session without
-	// ever taking the server lock and a room lock at the same time.
 	for _, session := range expired {
 		s.mu.RLock()
 		room, exists := s.rooms[session.RoomCode]
@@ -45,125 +52,127 @@ func (s *Server) cleanupExpiredSessionsOnce(now time.Time) {
 		if !exists || room == nil {
 			continue
 		}
-
-		room.mu.Lock()
-
-		delete(room.DisconnectedUsers, session.UserID)
-		expiredWasHost := session.IsHost || room.State.HostID == session.UserID
-
-		// Remove from room state users if still there
-		newUsers := make([]UserInfo, 0, len(room.State.Users))
-		for _, u := range room.State.Users {
-			if u.UserID != session.UserID {
-				newUsers = append(newUsers, u)
-			}
-		}
-		room.State.Users = newUsers
-
-		var hostChanged *HostChangedPayload
-		if expiredWasHost {
-			newHost := firstEligibleHost(room.Clients)
-			room.Host = newHost
-			room.HostDisconnectedAt = nil
-			if newHost != nil {
-				newHostID := newHost.clientID()
-				room.State.HostID = newHostID
-				for i := range room.State.Users {
-					room.State.Users[i].IsHost = room.State.Users[i].UserID == newHostID
-				}
-				hostChanged = &HostChangedPayload{
-					NewHostID:   newHostID,
-					NewHostName: newHost.userName(),
-				}
-			} else {
-				room.State.HostID = ""
-			}
-		}
-
-		// Capture information needed after releasing the room lock
-		shouldDeleteRoom := len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0 && now.After(minRetentionTime)
-		roomCode := room.Code
-		remainingClients := make([]*Client, 0, len(room.Clients))
-		for _, client := range room.Clients {
-			if client != nil {
-				remainingClients = append(remainingClients, client)
-			}
-		}
-
-		room.mu.Unlock()
-
-		// If the room is now empty and past the retention window, delete it.
-		if shouldDeleteRoom {
-			if s.deleteRoomIfEmpty(room) {
-				s.logger.Info("Deleted empty room",
-					zap.String("room_code", roomCode))
-			}
-			continue
-		}
-
-		// Notify remaining users that the expired session permanently left.
-		for _, client := range remainingClients {
-			client.sendMessage(s.logger, MsgTypeUserLeft, UserLeftPayload{
-				UserID:   session.UserID,
-				Username: session.Username,
-			})
-			if hostChanged != nil {
-				client.sendMessage(s.logger, MsgTypeHostChanged, *hostChanged)
-			}
-		}
+		s.expireSession(room, session, now.After(minRetentionTime))
 	}
 }
 
+// expireSession permanently removes a disconnected user whose grace period ran out.
+func (s *Server) expireSession(room *Room, session *Session, pastRetention bool) {
+	room.syncMu.Lock()
+	defer room.syncMu.Unlock()
+	room.mu.Lock()
+
+	if _, ok := room.DisconnectedUsers[session.UserID]; !ok {
+		// The user reconnected or left after we took the token.
+		room.mu.Unlock()
+		return
+	}
+	delete(room.DisconnectedUsers, session.UserID)
+	delete(room.PendingNotices, session.UserID)
+	removeUserSuggestionsLocked(room, session.UserID)
+	if room.OwnerID == session.UserID {
+		room.OwnerID = ""
+	}
+	room.State.Users = withoutUser(room.State.Users, session.UserID)
+
+	var change *hostChange
+	if room.State.HostID == session.UserID {
+		change = assignHostLocked(room, pickDeputy(room.Clients))
+	}
+
+	shouldDeleteRoom := len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0 && pastRetention
+	dead := hostlessDeadLocked(room)
+	remainingClients := roomClientsLocked(room)
+	room.mu.Unlock()
+
+	if shouldDeleteRoom {
+		if s.deleteRoomIfEmpty(room) {
+			s.logger.Info("Deleted empty room", zap.String("room_code", room.Code))
+		}
+		return
+	}
+	sendMessageToClients(s.logger, remainingClients, MsgTypeUserLeft, UserLeftPayload{
+		UserID:   session.UserID,
+		Username: session.Username,
+	})
+	s.deliverHostChange(remainingClients, change)
+	if dead {
+		s.closeRoom(room, noHostLeftReason)
+	}
+}
+
+func withoutUser(users []UserInfo, userID string) []UserInfo {
+	kept := make([]UserInfo, 0, len(users))
+	for _, u := range users {
+		if u.UserID != userID {
+			kept = append(kept, u)
+		}
+	}
+	return kept
+}
+
 func (s *Server) cleanupEmptyRooms() {
-	// Wait 5 minutes before first cleanup to avoid deleting rooms during startup
-	time.Sleep(EmptyRoomCleanupTimeout)
+	// Wait before first cleanup to avoid deleting rooms during startup
+	select {
+	case <-s.stop:
+		return
+	case <-time.After(EmptyRoomCleanupTimeout):
+	}
 
 	ticker := time.NewTicker(EmptyRoomCleanupInterval)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		now := time.Now()
-		minRetentionTime := s.startTime.Add(MinRoomRetentionAfterRestart)
-
-		s.mu.RLock()
-		rooms := make(map[string]*Room, len(s.rooms))
-		for roomCode, room := range s.rooms {
-			rooms[roomCode] = room
+	for {
+		select {
+		case <-s.stop:
+			return
+		case now := <-ticker.C:
+			s.cleanupEmptyRoomsOnce(now)
 		}
-		s.mu.RUnlock()
+	}
+}
 
-		for roomCode, room := range rooms {
-			if room == nil {
-				continue
-			}
+func (s *Server) cleanupEmptyRoomsOnce(now time.Time) {
+	minRetentionTime := s.startTime.Add(MinRoomRetentionAfterRestart)
 
-			room.mu.RLock()
-			isEmpty := len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0
-			emptySince := room.EmptySince
-			room.mu.RUnlock()
+	s.mu.RLock()
+	rooms := make(map[string]*Room, len(s.rooms))
+	for roomCode, room := range s.rooms {
+		rooms[roomCode] = room
+	}
+	s.mu.RUnlock()
 
-			if !isEmpty {
-				continue
-			}
+	for roomCode, room := range rooms {
+		if room == nil {
+			continue
+		}
 
-			// If room just became empty, mark it
-			if emptySince == nil {
-				room.mu.Lock()
-				nowPtr := now
-				room.EmptySince = &nowPtr
-				room.mu.Unlock()
-				s.logger.Info("Room became empty, scheduling cleanup",
-					zap.String("room_code", roomCode))
-				continue
-			}
+		room.mu.RLock()
+		isEmpty := len(room.Clients) == 0 && len(room.DisconnectedUsers) == 0
+		emptySince := room.EmptySince
+		room.mu.RUnlock()
 
-			// Check if room has been empty long enough and past retention window
-			if now.Sub(*emptySince) > EmptyRoomCleanupTimeout && now.After(minRetentionTime) {
-				if s.deleteRoomIfEmpty(room) {
-					s.logger.Info("Deleted empty room after inactivity",
-						zap.String("room_code", roomCode),
-						zap.Duration("empty_for", now.Sub(*emptySince)))
-				}
+		if !isEmpty {
+			continue
+		}
+
+		// If room just became empty, mark it
+		if emptySince == nil {
+			room.mu.Lock()
+			nowPtr := now
+			room.EmptySince = &nowPtr
+			room.mu.Unlock()
+			s.logger.Info("Room became empty, scheduling cleanup",
+				zap.String("room_code", roomCode))
+			continue
+		}
+
+		// Check if room has been empty long enough and past retention window
+		if now.Sub(*emptySince) > EmptyRoomCleanupTimeout && now.After(minRetentionTime) {
+			if s.deleteRoomIfEmpty(room) {
+				s.logger.Info("Deleted empty room after inactivity",
+					zap.String("room_code", roomCode),
+					zap.Duration("empty_for", now.Sub(*emptySince)))
 			}
 		}
 	}
@@ -188,26 +197,17 @@ func (s *Server) removeClient(c *Client) {
 }
 
 func (s *Server) removePendingJoin(c *Client) {
-	clientID := c.clientID()
-	if clientID == "" {
+	room := c.currentPendingRoom()
+	if room == nil {
 		return
 	}
-
-	s.mu.RLock()
-	rooms := make([]*Room, 0, len(s.rooms))
-	for _, room := range s.rooms {
-		rooms = append(rooms, room)
+	clientID := c.clientID()
+	room.mu.Lock()
+	if pending, exists := room.PendingJoins[clientID]; exists && pending == c {
+		delete(room.PendingJoins, clientID)
 	}
-	s.mu.RUnlock()
-
-	for _, room := range rooms {
-		room.mu.Lock()
-		if pending, exists := room.PendingJoins[clientID]; exists && pending == c {
-			delete(room.PendingJoins, clientID)
-			c.clearPendingRoom(room)
-		}
-		room.mu.Unlock()
-	}
+	c.clearPendingRoom(room)
+	room.mu.Unlock()
 }
 
 // handleClientDisconnect handles a client disconnecting - creates a session for reconnection
@@ -225,6 +225,9 @@ func (s *Server) handleClientDisconnect(c *Client) {
 		c.setSessionToken(sessionToken)
 	}
 
+	// syncMu keeps this presence change ordered with snapshots and broadcasts.
+	room.syncMu.Lock()
+	defer room.syncMu.Unlock()
 	s.mu.Lock()
 	room.mu.Lock()
 	if room.Clients[clientID] != c {
@@ -235,6 +238,7 @@ func (s *Server) handleClientDisconnect(c *Client) {
 	}
 
 	wasHost := room.Host == c
+	now := time.Now()
 
 	// Create session for reconnection
 	session := &Session{
@@ -242,14 +246,11 @@ func (s *Server) handleClientDisconnect(c *Client) {
 		Username:     username,
 		RoomCode:     room.Code,
 		IsHost:       wasHost,
-		DisconnectAt: time.Now(),
+		DisconnectAt: now,
 	}
 
 	// Remove from active clients but add to disconnected users
 	delete(room.Clients, clientID)
-	if room.BufferingUsers != nil {
-		delete(room.BufferingUsers, clientID)
-	}
 
 	if room.DisconnectedUsers == nil {
 		room.DisconnectedUsers = make(map[string]*Session)
@@ -264,40 +265,56 @@ func (s *Server) handleClientDisconnect(c *Client) {
 		}
 	}
 
-	// Track if host disconnected
 	if wasHost {
-		now := time.Now()
+		// HostID keeps the seat; dropping the pointer releases the old
+		// connection's buffers while the host is away.
+		room.Host = nil
 		room.HostDisconnectedAt = &now
 	}
 
 	c.clearRoom(room)
-
-	// Collect clients to notify before unlocking
-	clientsToNotify := make([]*Client, 0, len(room.Clients))
-	for _, client := range room.Clients {
-		if client != nil {
-			clientsToNotify = append(clientsToNotify, client)
-		}
-	}
+	clientsToNotify := roomClientsLocked(room)
 
 	room.EmptySince = nil
 	s.sessions[sessionToken] = session
 	room.mu.Unlock()
 	s.mu.Unlock()
 
-	// Notify other users about the temporary disconnect
-	for _, client := range clientsToNotify {
-		client.sendMessage(s.logger, MsgTypeUserDisconnected, UserDisconnectedPayload{
-			UserID:   clientID,
-			Username: username,
-		})
-	}
+	sendMessageToClients(s.logger, clientsToNotify, MsgTypeUserDisconnected, UserDisconnectedPayload{
+		UserID:   clientID,
+		Username: username,
+	})
 
 	s.logger.Info("User temporarily disconnected",
 		zap.String("username", username),
 		zap.String("user_id", clientID),
 		zap.String("room_code", room.Code),
 		zap.Bool("was_host", wasHost))
+}
+
+// replaceLiveSession detaches another connection that still holds token, so a
+// client that switched networks can resume before the old socket times out.
+// It reports whether a connection was replaced.
+func (s *Server) replaceLiveSession(c *Client, token string) bool {
+	var old *Client
+	s.mu.RLock()
+	for client := range s.clients {
+		if client != c && client.session() == token && client.currentRoom() != nil {
+			old = client
+			break
+		}
+	}
+	s.mu.RUnlock()
+	if old == nil {
+		return false
+	}
+	s.handleClientDisconnect(old)
+	old.closeSend()
+	if old.Conn != nil {
+		_ = old.Conn.Close()
+	}
+	s.logger.Info("Replaced live connection on reconnect", zap.String("user_id", old.clientID()))
+	return true
 }
 
 // handleReconnect handles a client trying to reconnect to their room
@@ -321,30 +338,48 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 		return
 	}
 
-	now := time.Now()
-	s.mu.Lock()
-	session, exists := s.sessions[p.SessionToken]
-	expired := exists && (session == nil || now.Sub(session.DisconnectAt) > ReconnectGracePeriod)
-	if exists && !expired && session.IsHost && !canHostClient(c) {
-		s.mu.Unlock()
-		c.sendError(s.logger, "host_not_allowed", "Only allowlisted clients can host rooms")
+	// claim marks the session as taken so concurrent attempts fail fast; the
+	// token itself is only deleted together with the membership change.
+	claim := func() (*Session, string) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		session, exists := s.sessions[p.SessionToken]
+		switch {
+		case !exists || (session != nil && session.claimed):
+			return nil, "session_not_found"
+		case session == nil || time.Since(session.DisconnectAt) > ReconnectGracePeriod:
+			// Expired sessions stay indexed so cleanup can remove the user and
+			// elect a new host; deleting the token here would orphan them.
+			return nil, "session_expired"
+		case session.IsHost && !canHostClient(c):
+			return nil, "host_not_allowed"
+		}
+		session.claimed = true
+		return session, ""
+	}
+	session, failure := claim()
+	if failure == "session_not_found" && s.replaceLiveSession(c, p.SessionToken) {
+		session, failure = claim()
+	}
+	switch failure {
+	case "session_not_found":
+		c.sendError(s.logger, failure, "Session not found or expired")
+		return
+	case "session_expired":
+		c.sendError(s.logger, failure, "Session has expired")
+		return
+	case "host_not_allowed":
+		c.sendError(s.logger, failure, "This client is not allowed to host rooms")
 		return
 	}
-	if exists {
-		delete(s.sessions, p.SessionToken)
-	}
-	s.mu.Unlock()
-
-	if !exists {
-		c.sendError(s.logger, "session_not_found", "Session not found or expired")
-		return
-	}
-
-	// Check if session is expired
-	if expired {
-		c.sendError(s.logger, "session_expired", "Session has expired")
-		return
-	}
+	consumed := false
+	defer func() {
+		if !consumed {
+			s.mu.Lock()
+			session.claimed = false
+			s.mu.Unlock()
+		}
+	}()
 
 	s.mu.RLock()
 	room, roomExists := s.rooms[session.RoomCode]
@@ -359,32 +394,35 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 	}
 
 	room.syncMu.Lock()
+	defer room.syncMu.Unlock()
+	s.mu.Lock()
 	room.mu.Lock()
 	disconnectedSession, disconnected := room.DisconnectedUsers[session.UserID]
-	if !disconnected || disconnectedSession == nil || room.Clients[session.UserID] != nil {
+	if s.sessions[p.SessionToken] != session || !disconnected || disconnectedSession == nil || room.Clients[session.UserID] != nil {
 		room.mu.Unlock()
-		room.syncMu.Unlock()
+		s.mu.Unlock()
 		c.sendError(s.logger, "session_not_found", "Session is no longer reconnectable")
 		return
 	}
 	if !c.trySetRoom(room) {
 		room.mu.Unlock()
-		room.syncMu.Unlock()
+		s.mu.Unlock()
 		c.sendError(s.logger, "already_in_room", "Leave the current room before reconnecting")
 		return
 	}
 
-	// Restore the client
+	// Restore the client. The token is consumed in the same critical section so
+	// a state snapshot sees either the session or the active member, never neither.
+	delete(s.sessions, p.SessionToken)
+	consumed = true
 	c.setClientID(session.UserID)
 	c.setUsername(session.Username)
 	c.setSessionToken(p.SessionToken)
 
-	// Add back to room clients
 	room.Clients[session.UserID] = c
 	delete(room.DisconnectedUsers, session.UserID)
 	room.EmptySince = nil
 
-	// Mark user as connected in room state
 	for i := range room.State.Users {
 		if room.State.Users[i].UserID == session.UserID {
 			room.State.Users[i].IsConnected = true
@@ -392,89 +430,50 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 		}
 	}
 
-	// Restore host status if they were the host
-	if session.IsHost || (canHostClient(c) && room.Host == nil && room.State.HostID == "") {
-		room.Host = c
-		room.HostDisconnectedAt = nil
-		room.State.HostID = session.UserID
-
-		// Update IsHost flag in users list
-		for i := range room.State.Users {
-			room.State.Users[i].IsHost = room.State.Users[i].UserID == session.UserID
+	// The seat is still theirs, failover gave it to a deputy they now take back,
+	// or the room has no host at all.
+	var change *hostChange
+	reclaim := room.State.HostID == session.UserID || room.OwnerID == session.UserID
+	if canHostClient(c) && (reclaim || (room.Host == nil && room.State.HostID == "")) {
+		change = assignHostLocked(room, c)
+		if room.OwnerID == session.UserID {
+			room.OwnerID = ""
 		}
 	}
 
-	// Calculate live position for reconnect state
-	nowMs := time.Now().UnixMilli()
-	liveState := cloneLiveRoomState(room.State, nowMs)
-
+	liveState := cloneLiveRoomState(room.State, serverNowMs())
 	isHost := room.Host == c
-	pendingJoinRequests := make([]JoinRequestPayload, 0, len(room.PendingJoins))
-	pendingSuggestions := make([]SuggestionReceivedPayload, 0, len(room.PendingSuggestions))
-	if isHost {
-		for _, pendingClient := range room.PendingJoins {
-			if pendingClient == nil || pendingClient.isClosed() {
-				continue
-			}
-			pendingJoinRequests = append(pendingJoinRequests, JoinRequestPayload{
-				UserID:   pendingClient.clientID(),
-				Username: pendingClient.userName(),
-			})
-		}
-		for _, suggestion := range room.PendingSuggestions {
-			if suggestion == nil {
-				continue
-			}
-			pendingSuggestions = append(pendingSuggestions, SuggestionReceivedPayload{
-				SuggestionID: suggestion.ID,
-				FromUserID:   suggestion.FromUserID,
-				FromUsername: suggestion.FromUsername,
-				TrackInfo:    cloneTrackInfo(suggestion.Track),
-			})
-		}
-	}
-
-	clientsToNotify := make([]*Client, 0, len(room.Clients))
+	notices := room.PendingNotices[session.UserID]
+	delete(room.PendingNotices, session.UserID)
+	others := make([]*Client, 0, len(room.Clients))
 	for _, client := range room.Clients {
 		if client != nil && client != c {
-			clientsToNotify = append(clientsToNotify, client)
+			others = append(others, client)
 		}
 	}
-
 	room.mu.Unlock()
+	s.mu.Unlock()
 
-	// Send reconnected message to the client with LIVE state
-	c.sendMessage(s.logger, MsgTypeReconnected, ReconnectedPayload{
+	c.reply(s.logger, MsgTypeReconnected, ReconnectedPayload{
 		RoomCode: room.Code,
 		UserID:   c.clientID(),
 		State:    liveState,
 		IsHost:   isHost,
 	})
 	s.sendPolicyQueueSnapshot(c, liveState)
-	room.syncMu.Unlock()
-
-	if isHost {
-		for _, joinRequest := range pendingJoinRequests {
-			c.sendMessage(s.logger, MsgTypeJoinRequest, joinRequest)
-		}
-		for _, suggestion := range pendingSuggestions {
-			c.sendMessage(s.logger, MsgTypeSuggestionReceived, suggestion)
-		}
-
-		if len(pendingJoinRequests) > 0 {
-			s.logger.Info("Replayed pending join requests to reconnected host",
-				zap.String("host_id", c.clientID()),
-				zap.String("room_code", room.Code),
-				zap.Int("pending_count", len(pendingJoinRequests)))
-		}
+	for _, notice := range notices {
+		c.sendMessage(s.logger, notice.MsgType, notice.Payload)
 	}
 
-	// Notify other users
-	for _, client := range clientsToNotify {
-		client.sendMessage(s.logger, MsgTypeUserReconnected, UserReconnectedPayload{
-			UserID:   c.clientID(),
-			Username: c.userName(),
-		})
+	sendMessageToClients(s.logger, others, MsgTypeUserReconnected, UserReconnectedPayload{
+		UserID:   c.clientID(),
+		Username: c.userName(),
+	})
+	if change != nil {
+		if change.announce != nil {
+			sendMessageToClients(s.logger, others, MsgTypeHostChanged, *change.announce)
+		}
+		s.replayHostWork(c, change.joins, change.suggestions)
 	}
 
 	s.logger.Info("User reconnected",
@@ -499,20 +498,17 @@ func (s *Server) deleteRoomIfEmpty(room *Room) bool {
 		return false
 	}
 
-	pendingClients := make([]*Client, 0, len(room.PendingJoins))
 	for _, client := range room.PendingJoins {
 		if client != nil {
+			// Queue the rejection before releasing the affiliation so it cannot
+			// arrive after the client's next join attempt.
+			client.sendMessage(s.logger, MsgTypeJoinRejected, JoinRejectedPayload{Reason: "Room is no longer available"})
 			client.clearPendingRoom(room)
-			pendingClients = append(pendingClients, client)
 		}
 	}
 	room.PendingJoins = make(map[string]*Client)
 	delete(s.rooms, room.Code)
 	room.mu.Unlock()
 	s.mu.Unlock()
-
-	for _, client := range pendingClients {
-		client.sendMessage(s.logger, MsgTypeJoinRejected, JoinRejectedPayload{Reason: "Room is no longer available"})
-	}
 	return true
 }

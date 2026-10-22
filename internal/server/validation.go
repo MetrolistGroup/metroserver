@@ -2,8 +2,22 @@ package server
 
 import (
 	"strings"
+	"time"
 	"unicode/utf8"
 )
+
+// clockBase anchors serverNowMs. Deriving later readings from its monotonic
+// component keeps playback extrapolation immune to wall-clock steps.
+var clockBase = time.Now()
+
+// serverNowMs is the server's protocol clock in Unix milliseconds. It is used
+// for playback anchors and pong timestamps so clients estimate one clock.
+func serverNowMs() int64 {
+	return clockBase.UnixMilli() + time.Since(clockBase).Milliseconds()
+}
+
+// MaxTrackIDLength bounds opaque track IDs, which are never rewritten.
+const MaxTrackIDLength = 200
 
 func sanitizeString(s string, maxLen int) string {
 	// Remove null bytes and other control characters
@@ -25,15 +39,32 @@ func sanitizeString(s string, maxLen int) string {
 	// Limit length
 	if len(s) > maxLen {
 		// Ensure we don't cut in the middle of a multibyte character
+		cut := maxLen
 		for i := maxLen; i > 0 && i > maxLen-4; i-- {
 			if utf8.ValidString(s[:i]) {
-				return s[:i]
+				cut = i
+				break
 			}
 		}
-		return s[:maxLen]
+		s = s[:cut]
 	}
 
-	return s
+	// Copy so a short stored value cannot pin a huge decoded message in memory.
+	return strings.Clone(s)
+}
+
+// validTrackID reports whether id can be used as an opaque track identifier.
+// IDs are compared byte-for-byte everywhere, so they are validated, not cleaned.
+func validTrackID(id string) bool {
+	if id == "" || len(id) > MaxTrackIDLength || !utf8.ValidString(id) {
+		return false
+	}
+	for _, r := range id {
+		if r < 32 || r == 127 {
+			return false
+		}
+	}
+	return true
 }
 
 func sanitizeTrackInfo(track *TrackInfo) bool {
@@ -41,18 +72,22 @@ func sanitizeTrackInfo(track *TrackInfo) bool {
 		return false
 	}
 
-	track.ID = sanitizeString(track.ID, 200)
+	if !validTrackID(track.ID) {
+		return false
+	}
+	track.ID = strings.Clone(track.ID)
 	track.Title = sanitizeString(track.Title, MaxTrackTitleLength)
 	track.Artist = sanitizeString(track.Artist, MaxTrackArtistLength)
 	track.Album = sanitizeString(track.Album, MaxTrackArtistLength)
 	track.Thumbnail = sanitizeString(track.Thumbnail, MaxTrackURLLength)
 	track.SuggestedBy = sanitizeString(track.SuggestedBy, MaxUsernameLength)
 
-	if track.ID == "" || track.Title == "" {
-		return false
+	if track.Title == "" {
+		// A missing title must not freeze the room on the previous track.
+		track.Title = sanitizeString(track.ID, MaxTrackTitleLength)
 	}
-	if track.Duration <= 0 {
-		track.Duration = 180000
+	if track.Duration < 0 {
+		track.Duration = 0 // unknown
 	} else if track.Duration > MaxTrackDuration {
 		track.Duration = MaxTrackDuration
 	}
@@ -100,11 +135,9 @@ func livePlaybackPosition(state *RoomState, nowMs int64) int64 {
 		}
 	}
 
-	if state.CurrentTrack != nil && state.CurrentTrack.Duration > 0 && position > state.CurrentTrack.Duration {
-		return state.CurrentTrack.Duration
-	}
-
-	return position
+	// Reported durations are metadata (clients send 0 or a 3-minute placeholder
+	// when unknown), so they never cap the host's authoritative position.
+	return min(position, MaxTrackDuration)
 }
 
 func cloneLiveRoomState(state *RoomState, nowMs int64) *RoomState {

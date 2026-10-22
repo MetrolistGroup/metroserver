@@ -21,7 +21,6 @@ func roomTestFixture() (*Server, *Room, *Client, *Client) {
 		PendingJoins:       make(map[string]*Client),
 		PendingSuggestions: make(map[string]*Suggestion),
 		DisconnectedUsers:  make(map[string]*Session),
-		BufferingUsers:     make(map[string]bool),
 		State: &RoomState{
 			RoomCode: "ROOM1234",
 			HostID:   "host",
@@ -52,7 +51,7 @@ func receiveRoomError(t *testing.T, client *Client, want string) {
 func TestSuggestionApproveAndRejectFlows(t *testing.T) {
 	t.Run("approve", func(t *testing.T) {
 		server, room, host, guest := roomTestFixture()
-		track := &TrackInfo{ID: " track-1 ", Title: " Song ", Artist: "Artist", Duration: 1000}
+		track := &TrackInfo{ID: "track-1", Title: " Song ", Artist: "Artist", Duration: 1000}
 		server.handleSuggestTrack(guest, encodeTestPayload(t, MsgTypeSuggestTrack, &SuggestTrackPayload{TrackInfo: track}))
 
 		var received pb.SuggestionReceivedPayload
@@ -498,9 +497,8 @@ func TestJoinValidationAndAuthorization(t *testing.T) {
 func TestKickAndTransferHost(t *testing.T) {
 	t.Run("kick", func(t *testing.T) {
 		server, room, host, guest := roomTestFixture()
-		room.BufferingUsers["guest"] = true
 		server.handleKickUser(host, encodeTestPayload(t, MsgTypeKickUser, &KickUserPayload{UserID: "guest", Reason: strings.Repeat("x", 220)}))
-		if guest.currentRoom() != nil || room.Clients["guest"] != nil || room.BufferingUsers["guest"] || len(room.State.Users) != 1 {
+		if guest.currentRoom() != nil || room.Clients["guest"] != nil || len(room.State.Users) != 1 {
 			t.Fatalf("guest was not fully removed: clients=%#v users=%#v", room.Clients, room.State.Users)
 		}
 		var kicked pb.KickedPayload
@@ -590,11 +588,10 @@ func TestLeaveRoomEmptyAndGuest(t *testing.T) {
 		server, room, host, guest := roomTestFixture()
 		guest.setSessionToken("guest-token")
 		server.sessions["guest-token"] = &Session{UserID: "guest", RoomCode: room.Code}
-		room.BufferingUsers["guest"] = true
 		room.DisconnectedUsers["guest"] = &Session{UserID: "guest"}
 
 		server.leaveRoom(guest)
-		if guest.currentRoom() != nil || room.Host != host || room.EmptySince != nil || len(room.State.Users) != 1 || room.BufferingUsers["guest"] {
+		if guest.currentRoom() != nil || room.Host != host || room.EmptySince != nil || len(room.State.Users) != 1 {
 			t.Fatalf("unexpected room after guest left: %#v", room)
 		}
 		if _, exists := server.sessions["guest-token"]; exists {

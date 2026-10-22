@@ -95,7 +95,7 @@ func TestMessageCodecDecodeRejectsInvalidEnvelopes(t *testing.T) {
 		{
 			name:    "wire payload too large",
 			data:    marshalCodecProto(t, &pb.Envelope{Type: "large", Payload: make([]byte, MaxReadMessageSize+1)}),
-			wantErr: "payload too large",
+			wantErr: "message too large",
 		},
 		{
 			name:    "malformed compressed payload",
@@ -105,7 +105,7 @@ func TestMessageCodecDecodeRejectsInvalidEnvelopes(t *testing.T) {
 		{
 			name:    "decoded payload too large",
 			data:    marshalCodecProto(t, &pb.Envelope{Type: "compressed", Payload: oversizedCompressed, Compressed: true}),
-			wantErr: "decompressed payload too large",
+			wantErr: "decompressed payload: message too large",
 		},
 	}
 

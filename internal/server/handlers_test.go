@@ -27,25 +27,46 @@ func encodeTestPayload(t *testing.T, msgType string, payload any) []byte {
 
 func receiveTestMessage(t *testing.T, client *Client, target proto.Message) string {
 	t.Helper()
+	var message []byte
+	// Pongs first, as the writer prioritizes them, so tests see a fixed order.
 	select {
-	case message, open := <-client.Send:
-		if !open {
-			t.Fatal("client send channel was closed")
+	case pong := <-client.pongs:
+		message = encodeTestPong(t, client, pong)
+	default:
+		select {
+		case pong := <-client.pongs:
+			message = encodeTestPong(t, client, pong)
+		case queued, open := <-client.Send:
+			if !open {
+				t.Fatal("client send channel was closed")
+			}
+			message = queued
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for client message")
+			return ""
 		}
-		msgType, payload, err := client.codec.Decode(message)
-		if err != nil {
+	}
+	msgType, payload, err := client.codec.Decode(message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != nil {
+		if err := proto.Unmarshal(payload, target); err != nil {
 			t.Fatal(err)
 		}
-		if target != nil {
-			if err := proto.Unmarshal(payload, target); err != nil {
-				t.Fatal(err)
-			}
-		}
-		return msgType
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for client message")
-		return ""
 	}
+	return msgType
+}
+
+// encodeTestPong stamps and encodes a pong the way writePong does.
+func encodeTestPong(t *testing.T, client *Client, pong queuedPong) []byte {
+	t.Helper()
+	pong.payload.ServerSendTime = serverNowMs()
+	encoded, err := client.codec.EncodeReply(MsgTypePong, pong.payload, pong.requestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return encoded
 }
 
 func TestPlaybackActionPlayClampsPositionAndBroadcasts(t *testing.T) {
@@ -60,7 +81,6 @@ func TestPlaybackActionPlayClampsPositionAndBroadcasts(t *testing.T) {
 		PendingJoins:       make(map[string]*Client),
 		PendingSuggestions: make(map[string]*Suggestion),
 		DisconnectedUsers:  make(map[string]*Session),
-		BufferingUsers:     make(map[string]bool),
 		State: &RoomState{
 			RoomCode:     "ROOM1234",
 			HostID:       "host",
@@ -79,8 +99,9 @@ func TestPlaybackActionPlayClampsPositionAndBroadcasts(t *testing.T) {
 	if !room.State.IsPlaying {
 		t.Fatal("room was not marked as playing")
 	}
-	if room.State.Position != 1000 {
-		t.Fatalf("position = %d, want 1000", room.State.Position)
+	// Reported durations are placeholders when unknown, so they never cap the host.
+	if room.State.Position != 1200 {
+		t.Fatalf("position = %d, want 1200", room.State.Position)
 	}
 	if room.State.LastUpdate == 0 {
 		t.Fatal("last update was not set")
@@ -90,7 +111,7 @@ func TestPlaybackActionPlayClampsPositionAndBroadcasts(t *testing.T) {
 	if msgType := receiveTestMessage(t, guest, &broadcast); msgType != MsgTypeSyncPlayback {
 		t.Fatalf("message type = %q, want %q", msgType, MsgTypeSyncPlayback)
 	}
-	if broadcast.Action != ActionPlay || broadcast.TrackId != "track" || broadcast.Position != 1000 || broadcast.ServerTime == 0 {
+	if broadcast.Action != ActionPlay || broadcast.TrackId != "track" || broadcast.Position != 1200 || broadcast.ServerTime == 0 {
 		t.Fatalf("unexpected playback broadcast: %#v", &broadcast)
 	}
 }
@@ -136,7 +157,6 @@ func TestLeaveRoomTransfersHostAndRemovesSession(t *testing.T) {
 		PendingJoins:       make(map[string]*Client),
 		PendingSuggestions: make(map[string]*Suggestion),
 		DisconnectedUsers:  make(map[string]*Session),
-		BufferingUsers:     make(map[string]bool),
 		State: &RoomState{
 			RoomCode: "ROOM1234",
 			HostID:   "host",

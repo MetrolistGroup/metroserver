@@ -20,28 +20,52 @@ const (
 	MsgTypeClientCapabilities = "client_capabilities"
 
 	// Server -> Client
-	MsgTypeRoomCreated        = "room_created"
-	MsgTypeJoinRequest        = "join_request"
-	MsgTypeJoinApproved       = "join_approved"
-	MsgTypeJoinRejected       = "join_rejected"
-	MsgTypeUserJoined         = "user_joined"
-	MsgTypeUserLeft           = "user_left"
-	MsgTypeSyncPlayback       = "sync_playback"
-	MsgTypeBufferWait         = "buffer_wait"
-	MsgTypeBufferComplete     = "buffer_complete"
-	MsgTypeError              = "error"
-	MsgTypePong               = "pong"
-	MsgTypeHostChanged        = "host_changed"
-	MsgTypeKicked             = "kicked"
-	MsgTypeSyncState          = "sync_state"
-	MsgTypeReconnected        = "reconnected"
-	MsgTypeUserReconnected    = "user_reconnected"
-	MsgTypeUserDisconnected   = "user_disconnected"
-	MsgTypeSuggestionReceived = "suggestion_received"
-	MsgTypeSuggestionApproved = "suggestion_approved"
-	MsgTypeSuggestionRejected = "suggestion_rejected"
-	MsgTypeServerCapabilities = "server_capabilities"
+	MsgTypeRoomCreated         = "room_created"
+	MsgTypeJoinRequest         = "join_request"
+	MsgTypeJoinApproved        = "join_approved"
+	MsgTypeJoinRejected        = "join_rejected"
+	MsgTypeUserJoined          = "user_joined"
+	MsgTypeUserLeft            = "user_left"
+	MsgTypeSyncPlayback        = "sync_playback"
+	MsgTypeBufferWait          = "buffer_wait"
+	MsgTypeBufferComplete      = "buffer_complete"
+	MsgTypeError               = "error"
+	MsgTypePong                = "pong"
+	MsgTypeHostChanged         = "host_changed"
+	MsgTypeKicked              = "kicked"
+	MsgTypeSyncState           = "sync_state"
+	MsgTypeReconnected         = "reconnected"
+	MsgTypeUserReconnected     = "user_reconnected"
+	MsgTypeUserDisconnected    = "user_disconnected"
+	MsgTypeSuggestionReceived  = "suggestion_received"
+	MsgTypeSuggestionApproved  = "suggestion_approved"
+	MsgTypeSuggestionRejected  = "suggestion_rejected"
+	MsgTypeServerCapabilities  = "server_capabilities"
+	MsgTypeAck                 = "ack"
+	MsgTypeServerRestarting    = "server_restarting"
+	MsgTypeSuggestionSubmitted = "suggestion_submitted"
 )
+
+// Optional protocol features negotiated through client_capabilities.features.
+// Fields added to existing messages are always sent; these names gate new
+// messages, actions and errors that older clients would not understand.
+const (
+	FeatureRequestID        = "request_id"        // echo envelope request IDs, ack silent commands, explicit sync throttling
+	FeatureOriginTag        = "origin_tag"        // sync_playback.origin_user_id
+	FeatureDriftReport      = "drift_report"      // ping position report -> pong drift_ms
+	FeatureDesyncCanary     = "desync_canary"     // ping state_hash -> pong state_mismatch + sync_state
+	FeatureServerRestarting = "server_restarting" // server_restarting before graceful shutdown
+	FeatureSuggestionAck    = "suggestion_ack"    // suggestion_submitted to the suggesting guest
+	FeatureReplaceQueue     = "replace_queue"     // playback_action.replace_queue
+	FeatureHostSequence     = "host_sequence"     // playback_action.host_sequence stale-observation guard
+	FeatureTrackRevision    = "track_revision"    // buffer_ready.track_revision
+	FeatureUpdateTrack      = "update_track"      // update_track action (metadata change without restart)
+)
+
+var serverFeatures = []string{
+	FeatureRequestID, FeatureOriginTag, FeatureDriftReport, FeatureDesyncCanary, FeatureServerRestarting,
+	FeatureSuggestionAck, FeatureReplaceQueue, FeatureHostSequence, FeatureTrackRevision, FeatureUpdateTrack,
+}
 
 // Playback actions
 const (
@@ -56,6 +80,7 @@ const (
 	ActionQueueClear  = "queue_clear"
 	ActionSyncQueue   = "sync_queue"
 	ActionSetVolume   = "set_volume"
+	ActionUpdateTrack = "update_track"
 )
 
 // CreateRoomPayload is for creating a new room
@@ -131,11 +156,20 @@ type PlaybackActionPayload struct {
 	ServerTime           int64       `json:"server_time,omitempty"`
 	Revision             uint64      `json:"revision,omitempty"`
 	CapturedAtServerTime int64       `json:"captured_at_server_time,omitempty"`
+	ReplaceQueue         bool        `json:"replace_queue,omitempty"`
+	OriginUserID         string      `json:"origin_user_id,omitempty"`
+	HostSequence         uint64      `json:"host_sequence,omitempty"`
 }
 
 type PingPayload struct {
-	ClientTime int64  `json:"client_time"`
-	Sequence   uint64 `json:"sequence"`
+	ClientTime                   int64  `json:"client_time"`
+	Sequence                     uint64 `json:"sequence"`
+	HasPosition                  bool   `json:"has_position,omitempty"`
+	TrackID                      string `json:"track_id,omitempty"`
+	Position                     int64  `json:"position,omitempty"`
+	PositionCapturedAtServerTime int64  `json:"position_captured_at_server_time,omitempty"`
+	HasStateHash                 bool   `json:"has_state_hash,omitempty"`
+	StateHash                    uint32 `json:"state_hash,omitempty"`
 }
 
 type PongPayload struct {
@@ -143,6 +177,21 @@ type PongPayload struct {
 	ServerReceiveTime int64  `json:"server_receive_time"`
 	ServerSendTime    int64  `json:"server_send_time"`
 	Sequence          uint64 `json:"sequence"`
+	DriftValid        bool   `json:"drift_valid,omitempty"`
+	DriftMs           int64  `json:"drift_ms,omitempty"`
+	StateMismatch     bool   `json:"state_mismatch,omitempty"`
+}
+
+// ServerRestartingPayload announces a graceful shutdown (feature server_restarting).
+type ServerRestartingPayload struct {
+	EtaMs  int64  `json:"eta_ms"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// SuggestionSubmittedPayload tells a guest its suggestion ID (feature suggestion_ack).
+type SuggestionSubmittedPayload struct {
+	SuggestionID string     `json:"suggestion_id"`
+	TrackInfo    *TrackInfo `json:"track_info"`
 }
 
 // Suggestion payloads
@@ -189,7 +238,8 @@ type TrackInfo struct {
 
 // BufferReadyPayload is sent when a user has finished buffering
 type BufferReadyPayload struct {
-	TrackID string `json:"track_id"`
+	TrackID       string `json:"track_id"`
+	TrackRevision uint64 `json:"track_revision,omitempty"`
 }
 
 // BufferWaitPayload is sent to tell users to wait for buffering
@@ -221,6 +271,7 @@ type RoomState struct {
 	Volume       float64     `json:"volume"`
 	Queue        []TrackInfo `json:"queue,omitempty"`
 	Revision     uint64      `json:"revision,omitempty"`
+	QueueTitle   string      `json:"queue_title,omitempty"`
 }
 
 // UserInfo contains information about a user
@@ -262,6 +313,7 @@ type SyncStatePayload struct {
 	Volume       float64     `json:"volume"`
 	Queue        []TrackInfo `json:"queue,omitempty"`
 	Revision     uint64      `json:"revision,omitempty"`
+	QueueTitle   string      `json:"queue_title,omitempty"`
 }
 
 // ReconnectPayload is for reconnecting to a room
@@ -270,15 +322,18 @@ type ReconnectPayload struct {
 }
 
 type ClientCapabilitiesPayload struct {
-	SupportsProtobuf    bool   `json:"supports_protobuf"`
-	SupportsCompression bool   `json:"supports_compression"`
-	ClientVersion       string `json:"client_version"`
+	SupportsProtobuf    bool     `json:"supports_protobuf"`
+	SupportsCompression bool     `json:"supports_compression"`
+	ClientVersion       string   `json:"client_version"`
+	Features            []string `json:"features,omitempty"`
 }
 
 type ServerCapabilitiesPayload struct {
-	SupportsProtobuf    bool   `json:"supports_protobuf"`
-	SupportsCompression bool   `json:"supports_compression"`
-	ServerVersion       string `json:"server_version"`
+	SupportsProtobuf    bool     `json:"supports_protobuf"`
+	SupportsCompression bool     `json:"supports_compression"`
+	ServerVersion       string   `json:"server_version"`
+	Features            []string `json:"features,omitempty"`
+	CanHost             bool     `json:"can_host"`
 }
 
 // ReconnectedPayload is sent when successfully reconnected

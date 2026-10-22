@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
 	"strings"
@@ -13,9 +14,9 @@ import (
 type uaTier int
 
 const (
-	uaAllow    uaTier = iota // normal service
+	uaAllow    uaTier = iota // normal service: the default for any client
 	uaAdvert                 // queue title becomes a Metrolist ad
-	uaRickroll               // uaAdvert, plus every track becomes Rick Astley
+	uaRickroll               // uaAdvert, plus Rick Astley slipped into the queue
 	uaBlock                  // handshake, one error frame, goodbye
 
 	uaTierCount = 4
@@ -47,14 +48,6 @@ const (
 	rickTrackDuration  = 213000
 )
 
-// Transport User-Agents are substring matches. Package-name User-Agents are
-// exact matches so repacks such as com.metrolist.music8 are not accidentally
-// allowed to host.
-var (
-	defaultAllowUA      = []string{"okhttp", "ktor-client"}
-	defaultAllowUAExact = []string{"com.metrolist.music", "com.metrolist.music.debug", "com.nevar.nzik", "com.nevar.nzik.debug"}
-)
-
 func rickTrack() TrackInfo {
 	return TrackInfo{
 		ID:        rickTrackID,
@@ -67,20 +60,18 @@ func rickTrack() TrackInfo {
 }
 
 type uaPolicy struct {
-	allow       []string // lowercased substrings
-	allowExact  []string
-	block       []string
+	block       []string // lowercased substrings
 	rickroll    []string
 	advert      []string
 	advertTitle string
 }
 
 func defaultUAPolicy() *uaPolicy {
-	return &uaPolicy{allow: defaultAllowUA, allowExact: defaultAllowUAExact, advertTitle: DefaultAdvertTitle}
+	return &uaPolicy{advertTitle: DefaultAdvertTitle}
 }
 
-// uaPolicyFile is the on-disk shape. allow extends the built-in defaults, but
-// higher-precedence block/rickroll/advert patterns may intentionally override them.
+// uaPolicyFile is the on-disk shape. Unmatched clients get normal service, so
+// allow is accepted for compatibility with older policy files and ignored.
 type uaPolicyFile struct {
 	Allow       []string `json:"allow"`
 	Block       []string `json:"block"`
@@ -100,17 +91,20 @@ func loadUAPolicy(path string) (*uaPolicy, error) {
 	if err != nil {
 		return nil, err
 	}
-	var file uaPolicyFile
+	var parsed *uaPolicyFile
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&file); err != nil {
+	if err := decoder.Decode(&parsed); err != nil {
 		return nil, err
+	}
+	if parsed == nil {
+		return nil, fmt.Errorf("UA policy must be a JSON object, not null")
 	}
 	if err := decoder.Decode(&struct{}{}); err != io.EOF {
 		return nil, fmt.Errorf("UA policy must contain exactly one JSON object")
 	}
+	file := *parsed
 
-	policy.allow = lowerPatterns(append(append([]string{}, defaultAllowUA...), file.Allow...))
 	policy.block = lowerPatterns(file.Block)
 	policy.rickroll = lowerPatterns(file.Rickroll)
 	policy.advert = lowerPatterns(file.Advert)
@@ -142,17 +136,8 @@ func uaMatches(userAgent string, patterns []string) bool {
 	return false
 }
 
-func uaMatchesExact(userAgent string, patterns []string) bool {
-	for _, pattern := range patterns {
-		if userAgent == pattern {
-			return true
-		}
-	}
-	return false
-}
-
 // resolve maps a User-Agent to its tier. block beats rickroll beats advert;
-// everything that is not explicitly allowlisted gets the ad treatment.
+// every client that no rule names gets normal service.
 func (p *uaPolicy) resolve(userAgent string) uaTier {
 	if p == nil {
 		return uaAllow
@@ -165,10 +150,8 @@ func (p *uaPolicy) resolve(userAgent string) uaTier {
 		return uaRickroll
 	case uaMatches(ua, p.advert):
 		return uaAdvert
-	case uaMatchesExact(ua, p.allowExact), uaMatches(ua, p.allow):
-		return uaAllow
 	}
-	return uaAdvert
+	return uaAllow
 }
 
 // rewriteForUATier returns the payload as it should reach a client in this tier.
@@ -180,136 +163,62 @@ func rewriteForUATier(tier uaTier, advertTitle string, payload interface{}) inte
 	default:
 		return payload
 	}
-	rick := rickTrack()
+	rickroll := tier == uaRickroll
 
 	switch v := payload.(type) {
 	case PlaybackActionPayload:
 		v.QueueTitle = advertTitle
-		if tier == uaAdvert {
-			return v
+		if rickroll && v.Queue != nil {
+			v.Queue = withRick(v.Queue)
 		}
-		v.TrackID = rick.ID
-		if v.TrackInfo != nil {
-			track := rick
-			v.TrackInfo = &track
-		}
-		v.Queue = rickQueue(v.Queue)
-		v.Position = rickPosition(v.Position)
 		return v
-
 	case SyncStatePayload:
-		if tier == uaAdvert {
-			return payload
+		v.QueueTitle = advertTitle
+		if rickroll {
+			v.Queue = withRick(v.Queue)
 		}
-		v.CurrentTrack = &rick
-		v.Queue = rickQueue(v.Queue)
-		v.Position = rickPosition(v.Position)
 		return v
-
 	case *RoomState:
-		if tier == uaAdvert || v == nil {
-			return payload
-		}
-		return rickState(v)
-
+		return policyState(v, advertTitle, rickroll)
 	case JoinApprovedPayload:
-		if tier == uaAdvert {
-			return payload
-		}
-		v.State = rickState(v.State)
+		v.State = policyState(v.State, advertTitle, rickroll)
 		return v
 	case ReconnectedPayload:
-		if tier == uaAdvert {
-			return payload
-		}
-		v.State = rickState(v.State)
-		return v
-
-	case BufferWaitPayload:
-		if tier == uaAdvert {
-			return payload
-		}
-		v.TrackID = rick.ID
-		return v
-	case BufferCompletePayload:
-		if tier == uaAdvert {
-			return payload
-		}
-		v.TrackID = rick.ID
-		return v
-
-	case SuggestionReceivedPayload:
-		if tier == uaAdvert || v.TrackInfo == nil {
-			return payload
-		}
-		track := rick
-		v.TrackInfo = &track
-		return v
-	case SuggestionApprovedPayload:
-		if tier == uaAdvert || v.TrackInfo == nil {
-			return payload
-		}
-		track := rick
-		v.TrackInfo = &track
+		v.State = policyState(v.State, advertTitle, rickroll)
 		return v
 	}
 	return payload
 }
 
-// ponytail: a rickrolled queue collapses to one entry on clients that dedupe
-// media IDs. Fine — they are not supposed to be here anyway.
-func rickQueue(queue []TrackInfo) []TrackInfo {
-	if len(queue) == 0 {
-		return nil
+// withRick returns a copy of queue with Rick Astley inserted at a position
+// that looks random but stays put while the queue is unchanged, so repeated
+// snapshots do not shuffle him around.
+func withRick(queue []TrackInfo) []TrackInfo {
+	hash := fnv.New32a()
+	for i := range queue {
+		hash.Write([]byte(queue[i].ID))
+		hash.Write([]byte{0})
 	}
-	rick := rickTrack()
-	rewritten := make([]TrackInfo, len(queue))
-	for i := range rewritten {
-		rewritten[i] = rick
-	}
-	return rewritten
+	at := int(hash.Sum32() % uint32(len(queue)+1))
+	rewritten := make([]TrackInfo, 0, len(queue)+1)
+	rewritten = append(rewritten, queue[:at]...)
+	rewritten = append(rewritten, rickTrack())
+	return append(rewritten, queue[at:]...)
 }
 
-func rickPosition(position int64) int64 {
-	if position <= 0 {
-		return 0
-	}
-	return position % rickTrackDuration
-}
-
-// rickState returns a copy of state in which every track is Rick Astley. A nil
-// state stays nil.
-func rickState(state *RoomState) *RoomState {
+// policyState returns a rewritten copy of state. A nil state stays nil.
+func policyState(state *RoomState, advertTitle string, rickroll bool) *RoomState {
 	if state == nil {
 		return nil
 	}
-	rick := rickTrack()
 	rewritten := cloneRoomState(state)
-	rewritten.CurrentTrack = &rick
-	rewritten.Queue = rickQueue(rewritten.Queue)
-	rewritten.Position = rickPosition(rewritten.Position)
-	return rewritten
-}
-
-// rickMappedTrackID translates a placeholder reported by a rickrolled client
-// back to the track the room is actually on, so buffer_ready and play/pause/seek
-// from that client stay valid.
-func rickMappedTrackID(tier uaTier, trackID string, state *RoomState) string {
-	if tier != uaRickroll || trackID != rickTrackID || state == nil || state.CurrentTrack == nil {
-		return trackID
+	rewritten.QueueTitle = advertTitle
+	if rickroll {
+		rewritten.Queue = withRick(rewritten.Queue)
 	}
-	return state.CurrentTrack.ID
+	return rewritten
 }
 
 func canHostClient(client *Client) bool {
 	return client != nil && client.uaTier == uaAllow
-}
-
-func firstEligibleHost(clients map[string]*Client) *Client {
-	for _, client := range clients {
-		if canHostClient(client) {
-			return client
-		}
-	}
-	return nil
 }

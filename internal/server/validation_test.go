@@ -2,6 +2,7 @@ package server
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"unicode/utf8"
 )
@@ -57,14 +58,23 @@ func TestSanitizeTrackInfo(t *testing.T) {
 		if sanitizeTrackInfo(nil) {
 			t.Fatal("nil track was accepted")
 		}
-		if sanitizeTrackInfo(&TrackInfo{ID: "track"}) {
-			t.Fatal("track without a title was accepted")
+		if sanitizeTrackInfo(&TrackInfo{Title: "title"}) {
+			t.Fatal("track without an ID was accepted")
+		}
+		for _, id := range []string{"bad\x00id", "bad\nid", strings.Repeat("x", MaxTrackIDLength+1), "\xff"} {
+			if sanitizeTrackInfo(&TrackInfo{ID: id, Title: "title"}) {
+				t.Fatalf("invalid ID %q was accepted", id)
+			}
+		}
+		untitled := &TrackInfo{ID: "track"}
+		if !sanitizeTrackInfo(untitled) || untitled.Title != "track" {
+			t.Fatalf("untitled track = %#v, want the ID as title", untitled)
 		}
 	})
 
 	t.Run("sanitizes fields and defaults duration", func(t *testing.T) {
 		track := &TrackInfo{
-			ID:          "  track-id  ",
+			ID:          " track-id ",
 			Title:       "  title\x00  ",
 			Artist:      "  artist  ",
 			Duration:    0,
@@ -73,11 +83,11 @@ func TestSanitizeTrackInfo(t *testing.T) {
 		if !sanitizeTrackInfo(track) {
 			t.Fatal("valid track was rejected")
 		}
-		if track.ID != "track-id" || track.Title != "title" || track.Artist != "artist" || track.SuggestedBy != "guest" {
+		if track.ID != " track-id " || track.Title != "title" || track.Artist != "artist" || track.SuggestedBy != "guest" {
 			t.Fatalf("track fields were not sanitized: %#v", track)
 		}
-		if track.Duration != 180000 {
-			t.Fatalf("duration = %d, want 180000", track.Duration)
+		if track.Duration != 0 {
+			t.Fatalf("duration = %d, want 0 (unknown)", track.Duration)
 		}
 	})
 
@@ -127,10 +137,16 @@ func TestLivePlaybackPosition(t *testing.T) {
 		{name: "playing", state: &RoomState{Position: 250, LastUpdate: 1000, IsPlaying: true}, nowMs: 1500, want: 750},
 		{name: "clock before update", state: &RoomState{Position: 250, LastUpdate: 2000, IsPlaying: true}, nowMs: 1500, want: 250},
 		{
-			name:  "clamped to track duration",
+			name:  "runs past reported duration",
 			state: &RoomState{Position: 900, LastUpdate: 1000, IsPlaying: true, CurrentTrack: &TrackInfo{Duration: 1000}},
 			nowMs: 1200,
-			want:  1000,
+			want:  1100,
+		},
+		{
+			name:  "clamped to maximum duration",
+			state: &RoomState{Position: MaxTrackDuration, LastUpdate: 1000, IsPlaying: true},
+			nowMs: 1200,
+			want:  MaxTrackDuration,
 		},
 	}
 

@@ -41,16 +41,43 @@ curl -H 'Authorization: Bearer replace-me' http://localhost:8080/uas
 
 `PORT` sets the HTTP/WebSocket port. It defaults to `8080`.
 
-`UA_POLICY_FILE` points at a JSON User-Agent policy. Without it the server runs
-with built-in defaults: Metrolist, N-Zik (`com.nevar.nzik` and
-`com.nevar.nzik.debug`), and recognized transport User-Agents can host;
-unmatched clients are served a Metrolist ad as the queue title. See `ua_policy.example.json`.
+`UA_POLICY_FILE` points at a JSON User-Agent policy. Every client gets normal
+service unless a rule names it: `block` refuses the connection, `advert` replaces
+the queue title with an ad, and `rickroll` does that and slips Never Gonna Give
+You Up into the queue. Only normal-service clients can host. The `allow` list is
+accepted for older policy files and has no effect. Send `SIGHUP` to reload the
+policy for new connections. See `ua_policy.example.json`.
 
 `DATABASE_FILE` sets the shared bbolt database path and defaults to
-`metroserver.db`. It stores restart recovery state and connection counts for up
-to 10,000 distinct, sanitized User-Agent values. `UA_ADMIN_TOKEN` enables
+`metroserver.db` (`/app/data/metroserver.db` in the Docker image). Rooms and
+reconnect tokens are written to it every two seconds, so a crash loses at most
+that much; it also stores connection counts for up to 10,000 distinct, sanitized
+User-Agent values. `UA_ADMIN_TOKEN` enables
 `/uas`; send it as a bearer token to read the counts. Without the token, `/uas`
 is not exposed. The database is created with `0600` permissions.
+
+## Protocol features
+
+Clients list optional features in `client_capabilities.features`; the server
+answers with the subset it enabled. Older clients that send none keep the
+original behaviour.
+
+| Feature | Effect |
+|---|---|
+| `request_id` | Envelope `request_id` is echoed on replies and errors; silent commands get an `ack`; throttled `request_sync` returns `sync_rate_limited`. |
+| `origin_tag` | `sync_playback.origin_user_id` names the user whose action caused it. |
+| `drift_report` | Positions reported in `ping` come back as `pong.drift_ms`. |
+| `desync_canary` | A `ping.state_hash` mismatch sets `pong.state_mismatch` and triggers a `sync_state`. |
+| `server_restarting` | `server_restarting` arrives before a graceful shutdown (close code 1012). |
+| `suggestion_ack` | Guests receive `suggestion_submitted` with their suggestion ID. |
+| `replace_queue` | `change_track` with `replace_queue` replaces the queue even when empty. |
+| `host_sequence` | Play/pause/seek with an older `host_sequence` are rejected as `stale_action`. |
+| `track_revision` | `buffer_ready.track_revision` must match the latest `change_track`. |
+| `update_track` | `update_track` corrects current-track metadata without restarting it. |
+
+A host that stays disconnected for 30 seconds is replaced by the connected
+listener with the lowest round trip; the original host takes the room back if
+they reconnect within the 15-minute grace period.
 
 ## Project Structure
 
@@ -122,6 +149,8 @@ services:
       retries: 3
       start_period: 5s
     restart: unless-stopped
+    # Graceful shutdown drains clients and saves state within 10 seconds.
+    stop_grace_period: 15s
 
 volumes:
   user-agent-data:
