@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -24,16 +25,16 @@ func Run() {
 	server := NewServer(logger)
 
 	// User-Agent policy (block / advertise Metrolist / rickroll freeloaders).
-	ua, err := loadUAPolicy(os.Getenv("UA_POLICY_FILE"))
+	policyFile := os.Getenv("UA_POLICY_FILE")
+	ua, err := loadUAPolicy(policyFile)
 	if err != nil {
 		logger.Fatal("Failed to load UA policy", zap.Error(err))
 	}
-	server.uaPolicy = ua
+	server.SetUAPolicy(ua)
 	logger.Info("User-Agent policy loaded",
 		zap.Int("block", len(ua.block)),
 		zap.Int("rickroll", len(ua.rickroll)),
-		zap.Int("advert", len(ua.advert)),
-		zap.Int("allow", len(ua.allow)+len(ua.allowExact)))
+		zap.Int("advert", len(ua.advert)))
 
 	databaseFile := os.Getenv("DATABASE_FILE")
 	if databaseFile == "" {
@@ -45,11 +46,12 @@ func Run() {
 	}
 	defer server.database.Close()
 
-	// Load previous state if exists
+	// Serving an empty server after a failed restore would overwrite the
+	// recoverable state on the next flush.
 	if err := server.LoadState(); err != nil {
-		logger.Error("Failed to load previous state", zap.Error(err))
-		// Continue anyway - not fatal
+		logger.Fatal("Failed to load previous state", zap.Error(err))
 	}
+	go server.runStateFlusher()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", server.handleWebSocket)
@@ -84,6 +86,21 @@ func Run() {
 		MaxHeaderBytes: MaxHeaderBytes,
 	}
 
+	// SIGHUP reloads the User-Agent policy for new connections.
+	reload := make(chan os.Signal, 1)
+	signal.Notify(reload, syscall.SIGHUP)
+	go func() {
+		for range reload {
+			policy, err := loadUAPolicy(policyFile)
+			if err != nil {
+				logger.Error("Failed to reload UA policy; keeping the current one", zap.Error(err))
+				continue
+			}
+			server.SetUAPolicy(policy)
+			logger.Info("User-Agent policy reloaded")
+		}
+	}()
+
 	// Set up graceful shutdown
 	shutdown := make(chan os.Signal, 1)
 	shutdownDone := make(chan struct{})
@@ -94,13 +111,18 @@ func Run() {
 		defer close(shutdownDone)
 		signal.Stop(shutdown)
 		logger.Info("Shutdown signal received")
+		// Everything below shares one budget that leaves time for the final save.
+		deadline := time.Now().Add(ShutdownTimeout - 2*time.Second)
 
-		ctx, cancel := context.WithTimeout(context.Background(), ShutdownTimeout)
+		server.announceRestart()
+		server.Close()
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(2*time.Second))
 		defer cancel()
 		if err := httpServer.Shutdown(ctx); err != nil {
-			logger.Error("HTTP shutdown failed", zap.Error(err))
+			logger.Warn("HTTP shutdown incomplete; closing remaining connections", zap.Error(err))
+			_ = httpServer.Close()
 		}
-		server.closeAllClients()
+		server.drainClients(deadline)
 
 		logger.Info("Saving state")
 		if err := server.SaveState(); err != nil {

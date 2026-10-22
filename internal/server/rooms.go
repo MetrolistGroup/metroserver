@@ -55,6 +55,23 @@ func (s *Server) handleSuggestTrack(c *Client, payload []byte) {
 		c.sendError(s.logger, "suggestions_full", "Too many pending suggestions")
 		return
 	}
+	mine := 0
+	for _, pending := range room.PendingSuggestions {
+		if pending == nil || pending.FromUserID != clientID {
+			continue
+		}
+		if pending.Track != nil && pending.Track.ID == p.TrackInfo.ID {
+			room.mu.Unlock()
+			c.sendError(s.logger, "duplicate_suggestion", "You already suggested this track")
+			return
+		}
+		mine++
+	}
+	if mine >= MaxSuggestionsPerUser {
+		room.mu.Unlock()
+		c.sendError(s.logger, "too_many_suggestions", "You have too many pending suggestions")
+		return
+	}
 
 	// Generate suggestion ID
 	s.rngMu.Lock()
@@ -79,6 +96,12 @@ func (s *Server) handleSuggestTrack(c *Client, payload []byte) {
 
 	if hostConnected {
 		host.sendMessage(s.logger, MsgTypeSuggestionReceived, notification)
+	}
+	if c.hasFeature(FeatureSuggestionAck) {
+		c.reply(s.logger, MsgTypeSuggestionSubmitted, SuggestionSubmittedPayload{
+			SuggestionID: sugID,
+			TrackInfo:    cloneTrackInfo(p.TrackInfo),
+		})
 	}
 
 	s.logger.Info("Suggestion received",
@@ -131,7 +154,13 @@ func (s *Server) handleApproveSuggestion(c *Client, payload []byte) {
 			return
 		}
 		suggestion.Track.SuggestedBy = suggestion.FromUsername
-		room.State.Queue = append([]TrackInfo{*suggestion.Track}, room.State.Queue...)
+		queue := append([]TrackInfo{*suggestion.Track}, room.State.Queue...)
+		if queueWireSize(queue) > MaxQueueBytes {
+			room.mu.Unlock()
+			c.sendError(s.logger, "queue_too_large", "Queue is too large")
+			return
+		}
+		room.State.Queue = queue
 	}
 
 	// Remove from pending after all validation succeeds.
@@ -143,7 +172,7 @@ func (s *Server) handleApproveSuggestion(c *Client, payload []byte) {
 		TrackInfo:  suggestion.Track,
 		InsertNext: true,
 		Queue:      append([]TrackInfo(nil), room.State.Queue...),
-		ServerTime: time.Now().UnixMilli(),
+		ServerTime: serverNowMs(),
 	}
 	room.State.Revision++
 	qa.Revision = room.State.Revision
@@ -154,6 +183,9 @@ func (s *Server) handleApproveSuggestion(c *Client, payload []byte) {
 	approved := SuggestionApprovedPayload{
 		SuggestionID: p.SuggestionID,
 		TrackInfo:    cloneTrackInfo(suggestion.Track),
+	}
+	if target == nil {
+		queueNoticeLocked(room, suggestion.FromUserID, MsgTypeSuggestionApproved, approved)
 	}
 	trackID := ""
 	if suggestion.Track != nil {
@@ -204,6 +236,12 @@ func (s *Server) handleRejectSuggestion(c *Client, payload []byte) {
 	// Notify suggester of rejection
 	reason := sanitizeString(p.Reason, 200)
 	target := room.Clients[suggestion.FromUserID]
+	if target == nil {
+		queueNoticeLocked(room, suggestion.FromUserID, MsgTypeSuggestionRejected, SuggestionRejectedPayload{
+			SuggestionID: p.SuggestionID,
+			Reason:       reason,
+		})
+	}
 	trackID := ""
 	if suggestion.Track != nil {
 		trackID = suggestion.Track.ID
@@ -225,7 +263,7 @@ func (s *Server) handleRejectSuggestion(c *Client, payload []byte) {
 
 func (s *Server) handleCreateRoom(c *Client, payload []byte) {
 	if !canHostClient(c) {
-		c.sendError(s.logger, "host_not_allowed", "Only allowlisted clients can host rooms")
+		c.sendError(s.logger, "host_not_allowed", "This client is not allowed to host rooms")
 		return
 	}
 
@@ -284,12 +322,14 @@ func (s *Server) handleCreateRoom(c *Client, payload []byte) {
 		c.sendError(s.logger, "room_limit_reached", "Server is at room capacity")
 		return
 	}
+	if c.source != "" && !s.allowRoomCreate(c.source, time.Now()) {
+		c.sendError(s.logger, "rate_limited", "Too many rooms created; try again in a minute")
+		return
+	}
 
-	c.setUsername(p.Username)
-	c.setSessionToken(s.generateSessionToken())
 	clientID := c.clientID()
-	username := c.userName()
-	sessionToken := c.session()
+	username := p.Username
+	sessionToken := s.generateSessionToken()
 
 	room := &Room{
 		Code:              code,
@@ -297,14 +337,13 @@ func (s *Server) handleCreateRoom(c *Client, payload []byte) {
 		Clients:           make(map[string]*Client),
 		PendingJoins:      make(map[string]*Client),
 		DisconnectedUsers: make(map[string]*Session),
-		BufferingUsers:    make(map[string]bool),
 		State: &RoomState{
 			RoomCode:   code,
 			HostID:     clientID,
 			Users:      []UserInfo{{UserID: clientID, Username: username, IsHost: true, IsConnected: true}},
 			IsPlaying:  false,
 			Position:   0,
-			LastUpdate: time.Now().UnixMilli(),
+			LastUpdate: serverNowMs(),
 			Volume:     1.0,
 			Queue:      []TrackInfo{},
 		},
@@ -315,6 +354,10 @@ func (s *Server) handleCreateRoom(c *Client, payload []byte) {
 		c.sendError(s.logger, "already_in_room", "You are already in a room")
 		return
 	}
+	// Commit identity only after claiming the room, so a concurrent approval
+	// elsewhere keeps the token it already sent.
+	c.setUsername(username)
+	c.setSessionToken(sessionToken)
 
 	s.mu.Lock()
 	if len(s.rooms) >= MaxRooms {
@@ -337,7 +380,7 @@ func (s *Server) handleCreateRoom(c *Client, payload []byte) {
 		zap.String("client_id", clientID),
 		zap.Int("session_token_len", len(sessionToken)))
 
-	c.sendMessage(s.logger, MsgTypeRoomCreated, RoomCreatedPayload{
+	c.reply(s.logger, MsgTypeRoomCreated, RoomCreatedPayload{
 		RoomCode:     code,
 		UserID:       clientID,
 		SessionToken: sessionToken,
@@ -415,7 +458,7 @@ func (s *Server) handleJoinRoom(c *Client, payload []byte) {
 		c.sendError(s.logger, "already_pending", "Your join request is already pending")
 		return
 	}
-	if len(room.Clients) >= MaxClientsPerRoom {
+	if roomMembersLocked(room) >= MaxClientsPerRoom {
 		room.mu.Unlock()
 		s.mu.RUnlock()
 		c.sendError(s.logger, "room_full", "Room is full")
@@ -513,7 +556,7 @@ func (s *Server) handleApproveJoin(c *Client, payload []byte) {
 		c.sendError(s.logger, "user_disconnected", "User has disconnected")
 		return
 	}
-	if len(room.Clients) >= MaxClientsPerRoom {
+	if roomMembersLocked(room) >= MaxClientsPerRoom {
 		room.mu.Unlock()
 		c.sendError(s.logger, "room_full", "Room is full")
 		return
@@ -547,7 +590,7 @@ func (s *Server) handleApproveJoin(c *Client, payload []byte) {
 		IsConnected: true,
 	})
 
-	nowMs := time.Now().UnixMilli()
+	nowMs := serverNowMs()
 	approval := JoinApprovedPayload{
 		RoomCode:     room.Code,
 		UserID:       joiningID,
@@ -607,17 +650,18 @@ func (s *Server) handleRejectJoin(c *Client, payload []byte) {
 		return
 	}
 
-	delete(room.PendingJoins, p.UserID)
-	joiningClient.clearPendingRoom(room)
-
 	reason := sanitizeString(p.Reason, 200)
 	if reason == "" {
 		reason = "Join request rejected by host"
 	}
 
+	// Queue the rejection before releasing the affiliation so it cannot be
+	// mistaken for a reply to the applicant's next join attempt.
 	joiningClient.sendMessage(s.logger, MsgTypeJoinRejected, JoinRejectedPayload{
 		Reason: reason,
 	})
+	delete(room.PendingJoins, p.UserID)
+	joiningClient.clearPendingRoom(room)
 
 	s.logger.Info("User rejected from room",
 		zap.String("username", joiningClient.userName()),
@@ -644,76 +688,71 @@ func (s *Server) handleKickUser(c *Client, payload []byte) {
 	}
 
 	clientID := c.clientID()
+	room.syncMu.Lock()
+	defer room.syncMu.Unlock()
+	s.mu.Lock()
 	room.mu.Lock()
 
 	if room.Host == nil || room.Host != c || room.HostDisconnectedAt != nil {
 		room.mu.Unlock()
+		s.mu.Unlock()
 		c.sendError(s.logger, "not_host", "Only the host can kick users")
 		return
 	}
 
 	if p.UserID == clientID {
 		room.mu.Unlock()
+		s.mu.Unlock()
 		c.sendError(s.logger, "cannot_kick_self", "You cannot kick yourself")
 		return
 	}
 
-	targetClient, exists := room.Clients[p.UserID]
-	if !exists {
+	targetClient := room.Clients[p.UserID]
+	disconnectedSession := room.DisconnectedUsers[p.UserID]
+	if targetClient == nil && disconnectedSession == nil {
 		room.mu.Unlock()
+		s.mu.Unlock()
 		c.sendError(s.logger, "user_not_found", "User not found in room")
 		return
 	}
 
-	if targetClient == nil {
-		room.mu.Unlock()
-		c.sendError(s.logger, "user_not_found", "User not found in room")
-		return
-	}
-
-	// Remove from room
-	delete(room.Clients, p.UserID)
-	delete(room.BufferingUsers, p.UserID)
-
-	// Update room state users list
-	newUsers := make([]UserInfo, 0, len(room.State.Users))
-	for _, u := range room.State.Users {
-		if u.UserID != p.UserID {
-			newUsers = append(newUsers, u)
-		}
-	}
-	room.State.Users = newUsers
-
-	kickedUsername := targetClient.userName()
-	targetClient.clearRoom(room)
-
-	// Collect clients to notify before unlocking
-	clientsToNotify := make([]*Client, 0, len(room.Clients))
-	for _, client := range room.Clients {
-		if client != nil {
-			clientsToNotify = append(clientsToNotify, client)
-		}
-	}
-
-	room.mu.Unlock()
-
-	// Notify the kicked user
 	reason := sanitizeString(p.Reason, 200)
 	if reason == "" {
 		reason = "You have been kicked from the room"
 	}
 
-	targetClient.sendMessage(s.logger, MsgTypeKicked, KickedPayload{
-		Reason: reason,
-	})
-
-	// Notify other users
-	for _, client := range clientsToNotify {
-		client.sendMessage(s.logger, MsgTypeUserLeft, UserLeftPayload{
-			UserID:   p.UserID,
-			Username: kickedUsername,
-		})
+	kickedUsername := ""
+	if targetClient != nil {
+		kickedUsername = targetClient.userName()
+		// Queue the notice before releasing the membership so it cannot follow
+		// the kicked client into another room.
+		targetClient.sendMessage(s.logger, MsgTypeKicked, KickedPayload{Reason: reason})
+		targetClient.clearRoom(room)
+		delete(room.Clients, p.UserID)
+	} else {
+		// Revoke an offline member too, or they could return without approval.
+		kickedUsername = disconnectedSession.Username
+		delete(room.DisconnectedUsers, p.UserID)
+		for token, session := range s.sessions {
+			if session != nil && session.RoomCode == room.Code && session.UserID == p.UserID {
+				delete(s.sessions, token)
+			}
+		}
 	}
+	delete(room.PendingNotices, p.UserID)
+	removeUserSuggestionsLocked(room, p.UserID)
+	if room.OwnerID == p.UserID {
+		room.OwnerID = ""
+	}
+	room.State.Users = withoutUser(room.State.Users, p.UserID)
+	clientsToNotify := roomClientsLocked(room)
+	room.mu.Unlock()
+	s.mu.Unlock()
+
+	sendMessageToClients(s.logger, clientsToNotify, MsgTypeUserLeft, UserLeftPayload{
+		UserID:   p.UserID,
+		Username: kickedUsername,
+	})
 
 	s.logger.Info("User kicked from room",
 		zap.String("username", kickedUsername),
@@ -739,79 +778,69 @@ func (s *Server) handleTransferHost(c *Client, payload []byte) {
 		return
 	}
 
+	room.syncMu.Lock()
+	defer room.syncMu.Unlock()
 	room.mu.Lock()
-	defer room.mu.Unlock()
 
 	// Only current host can transfer ownership
 	if room.Host == nil || room.Host != c || room.HostDisconnectedAt != nil {
+		room.mu.Unlock()
 		c.sendError(s.logger, "not_host", "Only the host can transfer ownership")
 		return
 	}
 
 	// Cannot transfer to self
 	if p.NewHostID == c.clientID() {
+		room.mu.Unlock()
 		c.sendError(s.logger, "cannot_transfer_to_self", "You are already the host")
 		return
 	}
 
-	// Find new host client
 	newHostClient, exists := room.Clients[p.NewHostID]
-	if !exists || newHostClient == nil {
+	if !exists || newHostClient == nil || newHostClient.isClosed() {
+		room.mu.Unlock()
 		c.sendError(s.logger, "user_not_found", "Target user not found in room")
 		return
 	}
 	if !canHostClient(newHostClient) {
-		c.sendError(s.logger, "host_not_allowed", "Only allowlisted clients can host rooms")
+		room.mu.Unlock()
+		c.sendError(s.logger, "host_not_allowed", "That user's client is not allowed to host rooms")
 		return
 	}
 
-	// Transfer host role
-	oldHostID := c.clientID()
 	oldHostName := c.userName()
-	newHostID := newHostClient.clientID()
-	newHostName := newHostClient.userName()
+	// An explicit hand-off replaces any owner waiting to reclaim after failover.
+	room.OwnerID = ""
+	change := assignHostLocked(room, newHostClient)
+	clients := roomClientsLocked(room)
+	room.mu.Unlock()
 
-	room.Host = newHostClient
-	room.State.HostID = newHostID
-
-	// Update users list in state
-	for i := range room.State.Users {
-		if room.State.Users[i].UserID == oldHostID {
-			room.State.Users[i].IsHost = false
-		}
-		if room.State.Users[i].UserID == p.NewHostID {
-			room.State.Users[i].IsHost = true
-		}
-	}
-
-	// Notify all users about the host change
-	hostChangedPayload := HostChangedPayload{
-		NewHostID:   newHostID,
-		NewHostName: newHostName,
-	}
-
-	for _, client := range room.Clients {
-		if client != nil {
-			client.sendMessage(s.logger, MsgTypeHostChanged, hostChangedPayload)
-		}
-	}
+	s.deliverHostChange(clients, change)
 
 	s.logger.Info("Host transferred",
 		zap.String("room_code", room.Code),
 		zap.String("old_host", oldHostName),
-		zap.String("new_host", newHostName))
+		zap.String("new_host", newHostClient.userName()))
 }
 
 func (s *Server) leaveRoom(c *Client) {
 	room := c.currentRoom()
 	if room == nil {
 		s.removePendingJoin(c)
-		return
+		if c.currentRoom() == nil {
+			// A fresh ID makes a delayed approval of the cancelled request miss.
+			c.setClientID(s.generateUserID())
+			return
+		}
+		// Approval won the race with the cancellation; leave the room instead.
+		room = c.currentRoom()
 	}
 
 	clientID := c.clientID()
 	username := c.userName()
 	sessionToken := c.session()
+	room.syncMu.Lock()
+	defer room.syncMu.Unlock()
 	room.mu.Lock()
 	if room.Clients[clientID] != c {
 		room.mu.Unlock()
@@ -820,20 +849,16 @@ func (s *Server) leaveRoom(c *Client) {
 	}
 
 	delete(room.Clients, clientID)
-	delete(room.BufferingUsers, clientID)
 	delete(room.PendingJoins, clientID)
 	delete(room.DisconnectedUsers, clientID)
+	delete(room.PendingNotices, clientID)
+	removeUserSuggestionsLocked(room, clientID)
+	if room.OwnerID == clientID {
+		room.OwnerID = ""
+	}
 
 	wasHost := room.Host == c
-
-	// Update room state users list
-	newUsers := make([]UserInfo, 0, len(room.State.Users))
-	for _, u := range room.State.Users {
-		if u.UserID != clientID {
-			newUsers = append(newUsers, u)
-		}
-	}
-	room.State.Users = newUsers
+	room.State.Users = withoutUser(room.State.Users, clientID)
 
 	c.clearRoom(room)
 
@@ -853,43 +878,12 @@ func (s *Server) leaveRoom(c *Client) {
 		return
 	}
 
-	// If host left, transfer to another user
-	var newHost *Client
+	var change *hostChange
 	if wasHost {
-		newHost = firstEligibleHost(room.Clients)
-		if newHost != nil {
-			room.Host = newHost
-			room.State.HostID = newHost.clientID()
-
-			// Update IsHost flag in users list
-			for i := range room.State.Users {
-				room.State.Users[i].IsHost = room.State.Users[i].UserID == newHost.clientID()
-			}
-		} else {
-			room.Host = nil
-			room.HostDisconnectedAt = nil
-			room.State.HostID = ""
-			for i := range room.State.Users {
-				room.State.Users[i].IsHost = false
-			}
-		}
+		change = assignHostLocked(room, pickDeputy(room.Clients))
 	}
-
-	// Collect clients and host info before unlocking
-	clientsToNotify := make([]*Client, 0, len(room.Clients))
-	for _, client := range room.Clients {
-		if client != nil {
-			clientsToNotify = append(clientsToNotify, client)
-		}
-	}
-	notifyHostChanged := wasHost && newHost != nil
-	hostID := ""
-	hostName := ""
-	if newHost != nil {
-		hostID = newHost.clientID()
-		hostName = newHost.userName()
-	}
-
+	dead := hostlessDeadLocked(room)
+	clientsToNotify := roomClientsLocked(room)
 	room.mu.Unlock()
 	if sessionToken != "" {
 		s.mu.Lock()
@@ -897,19 +891,13 @@ func (s *Server) leaveRoom(c *Client) {
 		s.mu.Unlock()
 	}
 
-	// Notify other users
-	for _, client := range clientsToNotify {
-		client.sendMessage(s.logger, MsgTypeUserLeft, UserLeftPayload{
-			UserID:   clientID,
-			Username: username,
-		})
-
-		if notifyHostChanged {
-			client.sendMessage(s.logger, MsgTypeHostChanged, HostChangedPayload{
-				NewHostID:   hostID,
-				NewHostName: hostName,
-			})
-		}
+	sendMessageToClients(s.logger, clientsToNotify, MsgTypeUserLeft, UserLeftPayload{
+		UserID:   clientID,
+		Username: username,
+	})
+	s.deliverHostChange(clientsToNotify, change)
+	if dead {
+		s.closeRoom(room, noHostLeftReason)
 	}
 
 	s.logger.Info("User left room",
@@ -917,4 +905,31 @@ func (s *Server) leaveRoom(c *Client) {
 		zap.String("user_id", clientID),
 		zap.String("room_code", room.Code),
 		zap.Bool("was_host", wasHost))
+}
+
+// roomMembersLocked counts active members plus disconnected members whose
+// seats are reserved for reconnection.
+func roomMembersLocked(room *Room) int {
+	return len(room.Clients) + len(room.DisconnectedUsers)
+}
+
+func removeUserSuggestionsLocked(room *Room, userID string) {
+	for id, suggestion := range room.PendingSuggestions {
+		if suggestion != nil && suggestion.FromUserID == userID {
+			delete(room.PendingSuggestions, id)
+		}
+	}
+}
+
+// queueNoticeLocked keeps a message for a disconnected member until they reconnect.
+func queueNoticeLocked(room *Room, userID, msgType string, payload interface{}) {
+	if _, away := room.DisconnectedUsers[userID]; !away {
+		return
+	}
+	if room.PendingNotices == nil {
+		room.PendingNotices = make(map[string][]pendingNotice)
+	}
+	if len(room.PendingNotices[userID]) < MaxSuggestionsPerUser {
+		room.PendingNotices[userID] = append(room.PendingNotices[userID], pendingNotice{MsgType: msgType, Payload: payload})
+	}
 }

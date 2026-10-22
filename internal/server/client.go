@@ -10,6 +10,17 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	// MaxQueuedBytes bounds one client's encoded outbound backlog.
+	MaxQueuedBytes = 8 * 1024 * 1024
+	pongQueueSize  = 8
+)
+
+type queuedPong struct {
+	payload   PongPayload
+	requestID uint64
+}
+
 type Client struct {
 	id                 atomic.Value // string
 	username           atomic.Value // string
@@ -30,12 +41,24 @@ type Client struct {
 	mu                 sync.Mutex
 	negotiationMu      sync.Mutex
 	codec              *MessageCodec // Message codec for encoding/decoding
+	pongs              chan queuedPong
+	queuedBytes        int
+	rateLimitNotified  bool
+	closeCode          int
+	closeReason        string
+	source             string
+	features           atomic.Pointer[map[string]bool]
+	requestID          atomic.Uint64 // envelope request ID of the message being handled
+	replied            atomic.Bool   // a reply or error was sent for requestID
+	lastPingSent       atomic.Int64  // unix nanos of the last control PING
+	rttMs              atomic.Int64  // last control PING round trip; 0 = unknown
 }
 
 func newClient(id string, conn *websocket.Conn) *Client {
 	c := &Client{
 		Conn:  conn,
 		Send:  make(chan []byte, 256),
+		pongs: make(chan queuedPong, pongQueueSize),
 		codec: NewMessageCodec(true),
 	}
 	c.setClientID(id)
@@ -126,6 +149,31 @@ func (c *Client) markAffiliationStarted() {
 	c.negotiationMu.Unlock()
 }
 
+func (c *Client) hasFeature(name string) bool {
+	features := c.features.Load()
+	return features != nil && (*features)[name]
+}
+
+func (c *Client) setFeatures(names []string) []string {
+	enabled := make(map[string]bool)
+	accepted := make([]string, 0, len(names))
+	for _, name := range names {
+		for _, supported := range serverFeatures {
+			if name == supported && !enabled[name] {
+				enabled[name] = true
+				accepted = append(accepted, name)
+			}
+		}
+	}
+	c.features.Store(&enabled)
+	return accepted
+}
+
+// roundTripMs is the last measured WebSocket PING round trip, or 0 if unknown.
+func (c *Client) roundTripMs() int64 {
+	return c.rttMs.Load()
+}
+
 func (c *Client) isClosed() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -133,9 +181,17 @@ func (c *Client) isClosed() bool {
 }
 
 func (c *Client) closeSend() {
+	c.closeSendWith(0, "")
+}
+
+// closeSendWith stops accepting messages; the writer drains what is queued and
+// then sends a close frame with code (if non-zero).
+func (c *Client) closeSendWith(code int, reason string) {
 	c.mu.Lock()
 	if !c.closed {
 		c.closed = true
+		c.closeCode = code
+		c.closeReason = reason
 		if c.Send != nil {
 			close(c.Send)
 		}
@@ -157,6 +213,19 @@ func (c *Client) allowMessage(now time.Time) bool {
 	}
 
 	c.rateMessageCount++
+	c.rateLimitNotified = false
+	return true
+}
+
+// shouldNotifyRateLimit reports whether this window's rate_limited error is
+// still unsent, so flooding cannot turn into one response per message.
+func (c *Client) shouldNotifyRateLimit() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.rateLimitNotified {
+		return false
+	}
+	c.rateLimitNotified = true
 	return true
 }
 
@@ -182,30 +251,96 @@ func (c *Client) writePump(logger *zap.Logger) {
 
 	for {
 		select {
+		case pong := <-c.pongs:
+			if !c.writePong(logger, pong) {
+				return
+			}
+		case <-ticker.C:
+			if !c.writePing() {
+				return
+			}
 		case message, ok := <-c.Send:
+			// Heartbeats and clock samples must not wait behind queued data.
+			if !c.writePriority(logger, ticker) {
+				return
+			}
 			if err := c.Conn.SetWriteDeadline(time.Now().Add(WriteTimeout)); err != nil {
 				logger.Debug("Failed to set write deadline", zap.String("client_id", c.clientID()), zap.Error(err))
 				return
 			}
 			if !ok {
-				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
+				c.mu.Lock()
+				code, reason := c.closeCode, c.closeReason
+				c.mu.Unlock()
+				frame := []byte{}
+				if code != 0 {
+					frame = websocket.FormatCloseMessage(code, reason)
+				}
+				c.Conn.WriteMessage(websocket.CloseMessage, frame)
 				return
 			}
+			c.mu.Lock()
+			c.queuedBytes -= len(message)
+			c.mu.Unlock()
 
 			if err := c.Conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
 				logger.Debug("Write error for client", zap.String("client_id", c.clientID()), zap.Error(err))
 				return
 			}
-
-		case <-ticker.C:
-			if err := c.Conn.SetWriteDeadline(time.Now().Add(WriteTimeout)); err != nil {
-				logger.Debug("Failed to set write deadline", zap.String("client_id", c.clientID()), zap.Error(err))
-				return
-			}
-			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return
-			}
 		}
+	}
+}
+
+func (c *Client) writePriority(logger *zap.Logger, ticker *time.Ticker) bool {
+	for {
+		select {
+		case pong := <-c.pongs:
+			if !c.writePong(logger, pong) {
+				return false
+			}
+		case <-ticker.C:
+			if !c.writePing() {
+				return false
+			}
+		default:
+			return true
+		}
+	}
+}
+
+func (c *Client) writePing() bool {
+	if err := c.Conn.SetWriteDeadline(time.Now().Add(WriteTimeout)); err != nil {
+		return false
+	}
+	c.lastPingSent.Store(time.Now().UnixNano())
+	return c.Conn.WriteMessage(websocket.PingMessage, nil) == nil
+}
+
+// writePong stamps server_send_time immediately before writing so queueing is
+// not mistaken for network delay by the client's clock estimator.
+func (c *Client) writePong(logger *zap.Logger, pong queuedPong) bool {
+	pong.payload.ServerSendTime = serverNowMs()
+	data, err := c.codec.EncodeReply(MsgTypePong, pong.payload, pong.requestID)
+	if err != nil {
+		logger.Error("Error encoding pong", zap.Error(err))
+		return true
+	}
+	if err := c.Conn.SetWriteDeadline(time.Now().Add(WriteTimeout)); err != nil {
+		return false
+	}
+	return c.Conn.WriteMessage(websocket.BinaryMessage, data) == nil
+}
+
+// queuePong hands a pong to the writer. Dropping one when the small priority
+// queue is full is harmless: clients treat pongs as samples.
+func (c *Client) queuePong(payload PongPayload) {
+	c.replied.Store(true)
+	if c.pongs == nil {
+		return
+	}
+	select {
+	case c.pongs <- queuedPong{payload: payload, requestID: c.requestID.Load()}:
+	default:
 	}
 }
 
@@ -215,6 +350,8 @@ func (c *Client) readPump(s *Server) {
 		c.Conn.Close()
 		if c.connectionSlot {
 			s.releaseConnectionSlot()
+			s.releaseSource(c.source)
+			s.pumps.Done()
 		}
 	}()
 
@@ -223,6 +360,11 @@ func (c *Client) readPump(s *Server) {
 		s.logger.Debug("Failed to set read deadline", zap.String("client_id", c.clientID()), zap.Error(err))
 	}
 	c.Conn.SetPongHandler(func(string) error {
+		if sent := c.lastPingSent.Load(); sent > 0 {
+			if rtt := (time.Now().UnixNano() - sent) / int64(time.Millisecond); rtt >= 0 {
+				c.rttMs.Store(max(rtt, 1))
+			}
+		}
 		if err := c.Conn.SetReadDeadline(time.Now().Add(ReadTimeout)); err != nil {
 			s.logger.Debug("Failed to set read deadline in pong handler", zap.String("client_id", c.clientID()), zap.Error(err))
 		}
@@ -231,6 +373,7 @@ func (c *Client) readPump(s *Server) {
 
 	for {
 		_, message, err := c.Conn.ReadMessage()
+		receivedAt := serverNowMs()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				s.logger.Debug("Read error for client", zap.String("client_id", c.clientID()), zap.Error(err))
@@ -239,7 +382,9 @@ func (c *Client) readPump(s *Server) {
 		}
 
 		if !c.allowMessage(time.Now()) {
-			c.sendError(s.logger, "rate_limited", "Too many messages")
+			if c.shouldNotifyRateLimit() {
+				c.sendError(s.logger, "rate_limited", "Too many messages")
+			}
 			continue
 		}
 
@@ -247,7 +392,7 @@ func (c *Client) readPump(s *Server) {
 			s.logger.Debug("Failed to refresh read deadline", zap.String("client_id", c.clientID()), zap.Error(err))
 			break
 		}
-		s.handleMessage(c, message)
+		s.handleMessage(c, message, receivedAt)
 	}
 }
 
@@ -282,6 +427,21 @@ func (c *Client) sendMessage(logger *zap.Logger, msgType string, payload interfa
 	c.sendEncodedMessage(logger, msgType, msgData)
 }
 
+// reply sends a direct response to the message currently being handled,
+// echoing its envelope request ID. Only call it from that message's handler.
+func (c *Client) reply(logger *zap.Logger, msgType string, payload interface{}) {
+	if c == nil || c.codec == nil || c.Send == nil {
+		return
+	}
+	c.replied.Store(true)
+	msgData, err := c.codec.EncodeReply(msgType, c.rewritePayload(payload), c.requestID.Load())
+	if err != nil {
+		logger.Error("Error encoding reply", zap.String("message_type", msgType), zap.Error(err))
+		return
+	}
+	c.sendEncodedMessage(logger, msgType, msgData)
+}
+
 func (c *Client) sendEncodedMessage(logger *zap.Logger, msgType string, msgData []byte) {
 	if c == nil || c.Send == nil {
 		return
@@ -295,13 +455,22 @@ func (c *Client) sendEncodedMessage(logger *zap.Logger, msgType string, msgData 
 		return
 	}
 
-	select {
-	case c.Send <- msgData:
-		logger.Debug("Message queued for sending", zap.String("message_type", msgType), zap.Int("size", len(msgData)))
-	default:
-		logger.Warn("Client send buffer full; closing slow client", zap.String("client_id", c.clientID()))
-		c.closed = true
-		close(c.Send)
+	if c.queuedBytes+len(msgData) <= MaxQueuedBytes {
+		select {
+		case c.Send <- msgData:
+			c.queuedBytes += len(msgData)
+			logger.Debug("Message queued for sending", zap.String("message_type", msgType), zap.Int("size", len(msgData)))
+			return
+		default:
+		}
+	}
+	// Dropping messages would leave the client permanently out of sync; drop the
+	// connection instead so it reconnects and receives a fresh snapshot.
+	logger.Warn("Client send buffer full; closing slow client", zap.String("client_id", c.clientID()))
+	c.closed = true
+	close(c.Send)
+	if c.Conn != nil {
+		_ = c.Conn.Close()
 	}
 }
 
@@ -336,7 +505,7 @@ func sendMessageToClients(logger *zap.Logger, clients []*Client, msgType string,
 }
 
 func (c *Client) sendError(logger *zap.Logger, code, message string) {
-	c.sendMessage(logger, MsgTypeError, ErrorPayload{
+	c.reply(logger, MsgTypeError, ErrorPayload{
 		Code:    code,
 		Message: message,
 	})

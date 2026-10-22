@@ -26,7 +26,6 @@ func lifecycleTestRoom(host, guest *Client) *Room {
 		PendingJoins:       make(map[string]*Client),
 		PendingSuggestions: make(map[string]*Suggestion),
 		DisconnectedUsers:  make(map[string]*Session),
-		BufferingUsers:     make(map[string]bool),
 		State: &RoomState{
 			RoomCode: "ROOM1234",
 			Users:    users,
@@ -61,7 +60,6 @@ func TestHandleClientDisconnectGuest(t *testing.T) {
 	guest.setUsername("Guest")
 	guest.setSessionToken("guest-token")
 	room := lifecycleTestRoom(host, guest)
-	room.BufferingUsers["guest"] = true
 	server.rooms[room.Code] = room
 
 	server.handleClientDisconnect(guest)
@@ -71,9 +69,6 @@ func TestHandleClientDisconnectGuest(t *testing.T) {
 	}
 	if _, exists := room.Clients["guest"]; exists {
 		t.Fatal("disconnected guest remains active")
-	}
-	if room.BufferingUsers["guest"] {
-		t.Fatal("disconnected guest remains in buffering users")
 	}
 	session := room.DisconnectedUsers["guest"]
 	if session == nil || session.UserID != "guest" || session.Username != "Guest" || session.RoomCode != room.Code || session.IsHost {
@@ -491,8 +486,9 @@ func TestHandleReconnectRejectsInvalidRequests(t *testing.T) {
 			server.handleReconnect(client, tt.payload(t))
 			receiveLifecycleError(t, client, tt.wantCode)
 			if tt.wantCode == "session_expired" {
-				if _, exists := server.sessions["expired"]; exists {
-					t.Fatal("expired session was not deleted")
+				// Cleanup needs the token to remove the user and elect a new host.
+				if _, exists := server.sessions["expired"]; !exists {
+					t.Fatal("expired session was deleted before cleanup could process it")
 				}
 			}
 			if tt.wantCode == "room_not_found" {
@@ -539,6 +535,8 @@ func TestRemoveClientPaths(t *testing.T) {
 		room2.State.RoomCode = room2.Code
 		room1.PendingJoins["pending"] = pending
 		room2.PendingJoins["pending"] = other
+		pending.trySetPendingRoom(room1)
+		other.trySetPendingRoom(room2)
 		server.rooms[room1.Code] = room1
 		server.rooms[room2.Code] = room2
 		server.clients[pending] = true

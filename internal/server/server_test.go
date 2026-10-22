@@ -56,7 +56,6 @@ func TestRemoveClientCleansPendingJoin(t *testing.T) {
 		PendingJoins:       map[string]*Client{"guest": guest},
 		DisconnectedUsers:  make(map[string]*Session),
 		PendingSuggestions: make(map[string]*Suggestion),
-		BufferingUsers:     make(map[string]bool),
 		State: &RoomState{
 			RoomCode: "ROOM1234",
 			HostID:   "host",
@@ -64,6 +63,7 @@ func TestRemoveClientCleansPendingJoin(t *testing.T) {
 		},
 	}
 	host.setRoom(room)
+	guest.trySetPendingRoom(room)
 	server.rooms[room.Code] = room
 	server.clients[guest] = true
 
@@ -86,7 +86,6 @@ func TestApproveSuggestionQueueFullKeepsSuggestion(t *testing.T) {
 		PendingJoins:       make(map[string]*Client),
 		DisconnectedUsers:  make(map[string]*Session),
 		PendingSuggestions: make(map[string]*Suggestion),
-		BufferingUsers:     make(map[string]bool),
 		State: &RoomState{
 			RoomCode: "ROOM1234",
 			HostID:   "host",
@@ -138,7 +137,6 @@ func TestSaveStateIncludesActiveSessionsAndLoadHasNoPlaceholderHost(t *testing.T
 		PendingJoins:       make(map[string]*Client),
 		DisconnectedUsers:  make(map[string]*Session),
 		PendingSuggestions: make(map[string]*Suggestion),
-		BufferingUsers:     make(map[string]bool),
 		State: &RoomState{
 			RoomCode: "ROOM1234",
 			HostID:   "host",
@@ -189,13 +187,29 @@ func TestSaveStateIncludesActiveSessionsAndLoadHasNoPlaceholderHost(t *testing.T
 		t.Fatalf("shared database lost User-Agent counts: %#v, %v", counts, err)
 	}
 
+	// State is no longer consumed on load: a startup that fails after loading
+	// must not lose it. The flusher keeps it current instead.
 	replayed := testServer()
 	replayed.database = restored.database
 	if err := replayed.LoadState(); err != nil {
 		t.Fatal(err)
 	}
-	if len(replayed.rooms) != 0 || len(replayed.sessions) != 0 {
-		t.Fatal("consumed state was replayed")
+	if replayed.rooms["ROOM1234"] == nil {
+		t.Fatal("state was lost after being loaded once")
+	}
+	restored.mu.Lock()
+	delete(restored.rooms, "ROOM1234")
+	restored.mu.Unlock()
+	if err := restored.FlushState(); err != nil {
+		t.Fatal(err)
+	}
+	empty := testServer()
+	empty.database = restored.database
+	if err := empty.LoadState(); err != nil {
+		t.Fatal(err)
+	}
+	if len(empty.rooms) != 0 {
+		t.Fatal("deleted room was not removed from the database")
 	}
 }
 
@@ -283,7 +297,6 @@ func TestExpiredHostSessionTransfersToActiveClient(t *testing.T) {
 		PendingJoins:       make(map[string]*Client),
 		DisconnectedUsers:  map[string]*Session{"host": expiredHost},
 		PendingSuggestions: make(map[string]*Suggestion),
-		BufferingUsers:     make(map[string]bool),
 		State: &RoomState{
 			RoomCode: "ROOM1234",
 			HostID:   "host",

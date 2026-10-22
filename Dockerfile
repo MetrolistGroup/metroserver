@@ -48,6 +48,10 @@ RUN mkdir /app/data && chown -R metrolist:metrolist /app
 # Switch to non-root user
 USER metrolist
 
+# Keep rooms and User-Agent counts on the data volume
+ENV DATABASE_FILE=/app/data/metroserver.db
+VOLUME /app/data
+
 # Expose port (default 8080, can be overridden)
 EXPOSE 8080
 

@@ -8,7 +8,7 @@ import (
 	"go.uber.org/zap"
 )
 
-const maxActionTransitCompensation = 5 * time.Second
+const maxActionTransitCompensation = 30 * time.Second
 
 func roomClientsLocked(room *Room) []*Client {
 	clients := make([]*Client, 0, len(room.Clients))
@@ -42,7 +42,6 @@ func validatePlaybackTrack(c *Client, logger *zap.Logger, state *RoomState, p *P
 	if state.CurrentTrack == nil {
 		return true
 	}
-	p.TrackID = rickMappedTrackID(c.uaTier, p.TrackID, state)
 	if p.TrackID == "" {
 		p.TrackID = state.CurrentTrack.ID
 		return true
@@ -54,38 +53,36 @@ func validatePlaybackTrack(c *Client, logger *zap.Logger, state *RoomState, p *P
 	return true
 }
 
-func clampPlaybackPosition(position int64, track *TrackInfo) int64 {
-	if position < 0 {
-		return 0
-	}
-	if track != nil && track.Duration > 0 && position > track.Duration {
-		return track.Duration
-	}
-	return position
+// clampPlaybackPosition bounds a position without trusting reported track
+// durations, which clients fill with placeholders when unknown.
+func clampPlaybackPosition(position int64) int64 {
+	return min(max(position, 0), MaxTrackDuration)
 }
 
-func compensateActionTransit(position, capturedAtServerTime, nowMs int64) int64 {
-	if capturedAtServerTime <= 0 || capturedAtServerTime >= nowMs {
+// compensateActionTransit advances a playing position by the time the action
+// spent in transit. Without a capture timestamp it falls back to half the
+// host's measured round trip.
+func compensateActionTransit(position, capturedAtServerTime, nowMs, rttMs int64) int64 {
+	elapsed := rttMs / 2
+	if capturedAtServerTime > 0 {
+		elapsed = nowMs - capturedAtServerTime
+	}
+	if elapsed <= 0 || elapsed > maxActionTransitCompensation.Milliseconds() {
+		// Future or ancient capture times come from a miscalibrated clock.
 		return position
 	}
-	elapsed := nowMs - capturedAtServerTime
-	if elapsed > maxActionTransitCompensation.Milliseconds() {
-		elapsed = maxActionTransitCompensation.Milliseconds()
+	if position > math.MaxInt64-elapsed {
+		return math.MaxInt64
 	}
 	return position + elapsed
 }
 
 func sanitizeQueue(queue []TrackInfo) []TrackInfo {
 	sanitized := make([]TrackInfo, 0, len(queue))
-	seen := make(map[string]struct{}, len(queue))
 	for _, track := range queue {
 		if !sanitizeTrackInfo(&track) {
 			continue
 		}
-		if _, exists := seen[track.ID]; exists {
-			continue
-		}
-		seen[track.ID] = struct{}{}
 		sanitized = append(sanitized, track)
 		if len(sanitized) == MaxQueueSize {
 			break
@@ -94,17 +91,14 @@ func sanitizeQueue(queue []TrackInfo) []TrackInfo {
 	return sanitized
 }
 
-func sanitizeUpcomingQueue(queue []TrackInfo, currentTrackID string) []TrackInfo {
-	if currentTrackID == "" {
-		return sanitizeQueue(queue)
-	}
-	upcoming := make([]TrackInfo, 0, len(queue))
+// queueWireSize estimates the encoded size of a queue snapshot.
+func queueWireSize(queue []TrackInfo) int {
+	size := 0
 	for i := range queue {
-		if queue[i].ID != currentTrackID {
-			upcoming = append(upcoming, queue[i])
-		}
+		t := &queue[i]
+		size += len(t.ID) + len(t.Title) + len(t.Artist) + len(t.Album) + len(t.Thumbnail) + len(t.SuggestedBy) + 32
 	}
-	return sanitizeQueue(upcoming)
+	return size
 }
 
 func containsTrackID(queue []TrackInfo, trackID string) bool {
@@ -114,6 +108,31 @@ func containsTrackID(queue []TrackInfo, trackID string) bool {
 		}
 	}
 	return false
+}
+
+// advanceQueue consumes the upcoming queue up to and including trackID, which
+// is what playing that entry means. A track that is not queued leaves it as is.
+func advanceQueue(queue []TrackInfo, trackID string) []TrackInfo {
+	for i := range queue {
+		if queue[i].ID == trackID {
+			return append([]TrackInfo(nil), queue[i+1:]...)
+		}
+	}
+	return queue
+}
+
+// syncSnapshotLocked builds a sync_state for the room. Caller holds room.mu.
+func syncSnapshotLocked(room *Room, nowMs int64) *SyncStatePayload {
+	return &SyncStatePayload{
+		CurrentTrack: cloneTrackInfo(room.State.CurrentTrack),
+		IsPlaying:    room.State.IsPlaying,
+		Position:     livePlaybackPosition(room.State, nowMs),
+		LastUpdate:   nowMs,
+		Queue:        append([]TrackInfo(nil), room.State.Queue...),
+		Volume:       room.State.Volume,
+		Revision:     room.State.Revision,
+		QueueTitle:   room.State.QueueTitle,
+	}
 }
 
 func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
@@ -151,7 +170,17 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 		return
 	}
 
-	nowMs := time.Now().UnixMilli()
+	nowMs := serverNowMs()
+	if p.HostSequence > 0 {
+		// Observations sampled before a newer action must not overwrite it.
+		if p.HostSequence <= room.LastHostSequence {
+			room.mu.Unlock()
+			c.sendError(s.logger, "stale_action", "Playback action is older than one already applied")
+			return
+		}
+		room.LastHostSequence = p.HostSequence
+	}
+	rttMs := c.roundTripMs()
 	switch p.Action {
 	case ActionPlay:
 		if room.State.CurrentTrack == nil {
@@ -168,8 +197,7 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 			room.mu.Unlock()
 			return
 		}
-		p.Position = compensateActionTransit(p.Position, p.CapturedAtServerTime, nowMs)
-		p.Position = clampPlaybackPosition(p.Position, room.State.CurrentTrack)
+		p.Position = clampPlaybackPosition(compensateActionTransit(p.Position, p.CapturedAtServerTime, nowMs, rttMs))
 		room.State.IsPlaying = true
 		room.State.Position = p.Position
 		room.State.LastUpdate = nowMs
@@ -184,7 +212,7 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 			room.mu.Unlock()
 			return
 		}
-		p.Position = clampPlaybackPosition(p.Position, room.State.CurrentTrack)
+		p.Position = clampPlaybackPosition(p.Position)
 		room.State.IsPlaying = false
 		room.State.Position = p.Position
 		room.State.LastUpdate = nowMs
@@ -200,9 +228,9 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 			return
 		}
 		if room.State.IsPlaying {
-			p.Position = compensateActionTransit(p.Position, p.CapturedAtServerTime, nowMs)
+			p.Position = compensateActionTransit(p.Position, p.CapturedAtServerTime, nowMs, rttMs)
 		}
-		p.Position = clampPlaybackPosition(p.Position, room.State.CurrentTrack)
+		p.Position = clampPlaybackPosition(p.Position)
 		room.State.Position = p.Position
 		room.State.LastUpdate = nowMs
 
@@ -217,17 +245,23 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 			c.sendError(s.logger, "invalid_track_info", "Track must have ID and title")
 			return
 		}
-		if p.Queue != nil {
-			p.Queue = sanitizeUpcomingQueue(p.Queue, p.TrackInfo.ID)
-			room.State.Queue = append([]TrackInfo(nil), p.Queue...)
+		// Protobuf cannot tell an empty queue from an omitted one, so an empty
+		// replacement needs the explicit replace_queue flag.
+		queue := advanceQueue(room.State.Queue, p.TrackInfo.ID)
+		if len(p.Queue) > 0 || p.ReplaceQueue {
+			queue = sanitizeQueue(p.Queue)
+			room.State.QueueTitle = p.QueueTitle
 		}
+		if queueWireSize(queue) > MaxQueueBytes {
+			room.mu.Unlock()
+			c.sendError(s.logger, "queue_too_large", "Queue is too large")
+			return
+		}
+		room.State.Queue = queue
 		room.State.CurrentTrack = cloneTrackInfo(p.TrackInfo)
-		room.State.Queue = sanitizeUpcomingQueue(room.State.Queue, p.TrackInfo.ID)
 		room.State.Position = 0
 		room.State.IsPlaying = false
 		room.State.LastUpdate = nowMs
-		room.HostStartPosition = 0
-		room.BufferingUsers = nil
 		p.TrackID = p.TrackInfo.ID
 		p.Position = 0
 		s.logger.Debug("Track changed", zap.String("room_code", room.Code), zap.String("track_id", p.TrackInfo.ID))
@@ -259,11 +293,18 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 			c.sendError(s.logger, "duplicate_track", "Track is already playing or queued")
 			return
 		}
+		var queue []TrackInfo
 		if p.InsertNext {
-			room.State.Queue = append([]TrackInfo{*p.TrackInfo}, room.State.Queue...)
+			queue = append([]TrackInfo{*p.TrackInfo}, room.State.Queue...)
 		} else {
-			room.State.Queue = append(room.State.Queue, *p.TrackInfo)
+			queue = append(append([]TrackInfo(nil), room.State.Queue...), *p.TrackInfo)
 		}
+		if queueWireSize(queue) > MaxQueueBytes {
+			room.mu.Unlock()
+			c.sendError(s.logger, "queue_too_large", "Queue is too large")
+			return
+		}
+		room.State.Queue = queue
 
 	case ActionQueueRemove:
 		if p.TrackID == "" {
@@ -283,12 +324,31 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 		room.State.Queue = []TrackInfo{}
 
 	case ActionSyncQueue:
-		currentTrackID := ""
-		if room.State.CurrentTrack != nil {
-			currentTrackID = room.State.CurrentTrack.ID
+		queue := sanitizeQueue(p.Queue)
+		if queueWireSize(queue) > MaxQueueBytes {
+			room.mu.Unlock()
+			c.sendError(s.logger, "queue_too_large", "Queue is too large")
+			return
 		}
-		p.Queue = sanitizeUpcomingQueue(p.Queue, currentTrackID)
-		room.State.Queue = append([]TrackInfo(nil), p.Queue...)
+		room.State.Queue = queue
+		room.State.QueueTitle = p.QueueTitle
+
+	case ActionUpdateTrack:
+		// Metadata correction (e.g. a duration learned after loading) that keeps
+		// position and play state, unlike change_track.
+		if p.TrackInfo == nil || !sanitizeTrackInfo(p.TrackInfo) {
+			room.mu.Unlock()
+			c.sendError(s.logger, "invalid_track_info", "Track info is required")
+			return
+		}
+		if room.State.CurrentTrack == nil || room.State.CurrentTrack.ID != p.TrackInfo.ID {
+			room.mu.Unlock()
+			c.sendError(s.logger, "stale_track", "Track update targets a stale track")
+			return
+		}
+		room.State.CurrentTrack = cloneTrackInfo(p.TrackInfo)
+		p.TrackID = p.TrackInfo.ID
+		p.Position = livePlaybackPosition(room.State, nowMs)
 
 	case ActionSetVolume:
 		if math.IsNaN(p.Volume) || math.IsInf(p.Volume, 0) || p.Volume < 0 || p.Volume > 1 {
@@ -310,8 +370,20 @@ func (s *Server) handlePlaybackAction(c *Client, payload []byte) {
 
 	room.State.Revision++
 	p.Revision = room.State.Revision
+	if p.Action == ActionChangeTrack {
+		room.TrackRevision = p.Revision
+	}
 	p.ServerTime = nowMs
+	// The position is already compensated; forwarding the capture time would
+	// invite clients to compensate twice.
+	p.CapturedAtServerTime = 0
+	p.HostSequence = 0
+	p.OriginUserID = c.clientID()
+	p.QueueTitle = room.State.QueueTitle
 	clients := roomClientsLocked(room)
+	if p.Action == ActionUpdateTrack {
+		clients = withFeature(clients, FeatureUpdateTrack)
+	}
 	room.mu.Unlock()
 
 	sendMessageToClients(s.logger, clients, MsgTypeSyncPlayback, p)
@@ -353,51 +425,35 @@ func (s *Server) handleBufferReady(c *Client, payload []byte) {
 		c.sendError(s.logger, "stale_track", "Buffer readiness targets a stale track")
 		return
 	}
-	p.TrackID = rickMappedTrackID(c.uaTier, p.TrackID, room.State)
-	if p.TrackID != room.State.CurrentTrack.ID {
+	if p.TrackID != room.State.CurrentTrack.ID || (p.TrackRevision != 0 && p.TrackRevision != room.TrackRevision) {
 		room.mu.Unlock()
 		c.sendError(s.logger, "stale_track", "Buffer readiness targets a stale track")
 		return
 	}
 
-	coordinatedBuffering := room.BufferingUsers != nil
-	if coordinatedBuffering {
-		delete(room.BufferingUsers, clientID)
-		if len(room.BufferingUsers) > 0 {
-			waitingFor := make([]string, 0, len(room.BufferingUsers))
-			for id := range room.BufferingUsers {
-				waitingFor = append(waitingFor, id)
-			}
-			clients := roomClientsLocked(room)
-			room.mu.Unlock()
-			sendMessageToClients(s.logger, clients, MsgTypeBufferWait, BufferWaitPayload{TrackID: p.TrackID, WaitingFor: waitingFor})
-			return
-		}
-		room.BufferingUsers = nil
-	}
-
-	nowMs := time.Now().UnixMilli()
+	nowMs := serverNowMs()
 	position := livePlaybackPosition(room.State, nowMs)
 	trackID := room.State.CurrentTrack.ID
 	playing := room.State.IsPlaying
 	revision := room.State.Revision
-	clients := []*Client{c}
-	if coordinatedBuffering {
-		clients = roomClientsLocked(room)
-	}
+	isHost := room.Host == c
 	room.mu.Unlock()
 
-	sendMessageToClients(s.logger, clients, MsgTypeSyncPlayback, PlaybackActionPayload{
-		Action: ActionSeek, TrackID: trackID, Position: position, ServerTime: nowMs, Revision: revision,
-	})
-	stateAction := ActionPause
-	if playing {
-		stateAction = ActionPlay
+	// The host is the timeline; steering it to the server's projection would
+	// pull it back to where it was when the track started.
+	if !isHost {
+		c.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
+			Action: ActionSeek, TrackID: trackID, Position: position, ServerTime: nowMs, Revision: revision,
+		})
+		stateAction := ActionPause
+		if playing {
+			stateAction = ActionPlay
+		}
+		c.sendMessage(s.logger, MsgTypeSyncPlayback, PlaybackActionPayload{
+			Action: stateAction, TrackID: trackID, Position: position, ServerTime: nowMs, Revision: revision,
+		})
 	}
-	sendMessageToClients(s.logger, clients, MsgTypeSyncPlayback, PlaybackActionPayload{
-		Action: stateAction, TrackID: trackID, Position: position, ServerTime: nowMs, Revision: revision,
-	})
-	sendMessageToClients(s.logger, clients, MsgTypeBufferComplete, BufferCompletePayload{TrackID: trackID})
+	c.reply(s.logger, MsgTypeBufferComplete, BufferCompletePayload{TrackID: trackID})
 }
 
 func (s *Server) handleRequestSync(c *Client) {
@@ -418,19 +474,13 @@ func (s *Server) handleRequestSync(c *Client) {
 	now := time.Now()
 	if !c.allowSyncResponse(now) {
 		room.mu.RUnlock()
+		if c.hasFeature(FeatureRequestID) {
+			c.sendError(s.logger, "sync_rate_limited", fmt.Sprintf("Retry after %d ms", SyncResponseInterval.Milliseconds()))
+		}
 		return
 	}
-	nowMs := now.UnixMilli()
-	position := livePlaybackPosition(room.State, nowMs)
-	response := SyncStatePayload{
-		CurrentTrack: cloneTrackInfo(room.State.CurrentTrack),
-		IsPlaying:    room.State.IsPlaying,
-		Position:     position,
-		LastUpdate:   nowMs,
-		Queue:        append([]TrackInfo(nil), room.State.Queue...),
-		Volume:       room.State.Volume,
-		Revision:     room.State.Revision,
-	}
+	response := *syncSnapshotLocked(room, serverNowMs())
+	position := response.Position
 	room.mu.RUnlock()
 
 	s.logger.Debug("Sync request received",
@@ -439,5 +489,15 @@ func (s *Server) handleRequestSync(c *Client) {
 		zap.Bool("response_playing", response.IsPlaying),
 		zap.Int64("position", position),
 		zap.Uint64("revision", response.Revision))
-	c.sendMessage(s.logger, MsgTypeSyncState, response)
+	c.reply(s.logger, MsgTypeSyncState, response)
+}
+
+func withFeature(clients []*Client, feature string) []*Client {
+	kept := clients[:0]
+	for _, client := range clients {
+		if client.hasFeature(feature) {
+			kept = append(kept, client)
+		}
+	}
+	return kept
 }

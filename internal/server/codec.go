@@ -15,9 +15,15 @@ import (
 
 const (
 	MaxEnvelopeTypeLength = 64
-	MaxDecodedPayloadSize = 1024 * 1024 // 1MB after optional decompression
+	MaxDecodedPayloadSize = 2 * 1024 * 1024 // matches the KMP client's decoded limit
 	MaxQueueInputSize     = MaxQueueSize * 2
+	MaxClientFeatures     = 32
+	MaxFeatureNameLength  = 64
 )
+
+// errMessageTooLarge marks size-limit failures so they are not reported as
+// malformed input.
+var errMessageTooLarge = errors.New("message too large")
 
 // MessageCodec handles encoding/decoding of messages using Protocol Buffers
 type MessageCodec struct {
@@ -37,16 +43,27 @@ func (c *MessageCodec) setCompressionEnabled(enabled bool) {
 
 // Encode encodes a message using Protocol Buffers
 func (c *MessageCodec) Encode(msgType string, payload interface{}) ([]byte, error) {
-	return c.encodeProtobuf(msgType, payload)
+	return c.encodeProtobuf(msgType, payload, 0)
+}
+
+// EncodeReply encodes a message that answers the request with requestID.
+func (c *MessageCodec) EncodeReply(msgType string, payload interface{}, requestID uint64) ([]byte, error) {
+	return c.encodeProtobuf(msgType, payload, requestID)
 }
 
 // Decode decodes a protobuf message
 func (c *MessageCodec) Decode(data []byte) (string, []byte, error) {
+	msgType, payload, _, err := c.decodeProtobuf(data)
+	return msgType, payload, err
+}
+
+// DecodeRequest decodes a protobuf message and its envelope request ID.
+func (c *MessageCodec) DecodeRequest(data []byte) (string, []byte, uint64, error) {
 	return c.decodeProtobuf(data)
 }
 
 // encodeProtobuf encodes a message using Protocol Buffers
-func (c *MessageCodec) encodeProtobuf(msgType string, payload interface{}) ([]byte, error) {
+func (c *MessageCodec) encodeProtobuf(msgType string, payload interface{}, requestID uint64) ([]byte, error) {
 	var payloadBytes []byte
 
 	if payload != nil {
@@ -76,6 +93,7 @@ func (c *MessageCodec) encodeProtobuf(msgType string, payload interface{}) ([]by
 		Type:       msgType,
 		Payload:    payloadBytes,
 		Compressed: compressed,
+		RequestId:  requestID,
 	}
 
 	envelopeBytes, err := proto.Marshal(envelope)
@@ -87,35 +105,35 @@ func (c *MessageCodec) encodeProtobuf(msgType string, payload interface{}) ([]by
 }
 
 // decodeProtobuf decodes a protobuf message
-func (c *MessageCodec) decodeProtobuf(data []byte) (string, []byte, error) {
+func (c *MessageCodec) decodeProtobuf(data []byte) (string, []byte, uint64, error) {
 	if len(data) == 0 {
-		return "", nil, fmt.Errorf("empty data received")
+		return "", nil, 0, fmt.Errorf("empty data received")
 	}
 
 	envelope := &pb.Envelope{}
 	if err := proto.Unmarshal(data, envelope); err != nil {
-		return "", nil, fmt.Errorf("unmarshal envelope (received %d bytes): %w", len(data), err)
+		return "", nil, 0, fmt.Errorf("unmarshal envelope (received %d bytes): %w", len(data), err)
 	}
 	if len(envelope.Type) > MaxEnvelopeTypeLength {
-		return "", nil, fmt.Errorf("message type too long")
+		return "", nil, envelope.RequestId, fmt.Errorf("message type too long")
 	}
 	if len(envelope.Payload) > MaxReadMessageSize {
-		return "", nil, fmt.Errorf("payload too large")
+		return "", nil, envelope.RequestId, fmt.Errorf("payload: %w", errMessageTooLarge)
 	}
 
 	payloadBytes := envelope.Payload
 	if envelope.Compressed {
 		decompressed, err := decompressData(payloadBytes)
 		if err != nil {
-			return "", nil, fmt.Errorf("decompress payload: %w", err)
+			return "", nil, envelope.RequestId, fmt.Errorf("decompress payload: %w", err)
 		}
 		payloadBytes = decompressed
 	}
 	if len(payloadBytes) > MaxDecodedPayloadSize {
-		return "", nil, fmt.Errorf("decoded payload too large")
+		return "", nil, envelope.RequestId, fmt.Errorf("decoded payload: %w", errMessageTooLarge)
 	}
 
-	return envelope.Type, payloadBytes, nil
+	return envelope.Type, payloadBytes, envelope.RequestId, nil
 }
 
 // compressData compresses data using gzip
@@ -149,7 +167,7 @@ func decompressData(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	if len(out) > MaxDecodedPayloadSize {
-		return nil, errors.New("decompressed payload too large")
+		return nil, fmt.Errorf("decompressed payload: %w", errMessageTooLarge)
 	}
 	return out, nil
 }
@@ -167,33 +185,13 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 	case *RejectJoinPayload:
 		return &pb.RejectJoinPayload{UserId: p.UserID, Reason: p.Reason}, nil
 	case *PlaybackActionPayload:
-		pbPayload := &pb.PlaybackActionPayload{
-			Action:               p.Action,
-			TrackId:              p.TrackID,
-			Position:             p.Position,
-			InsertNext:           p.InsertNext,
-			QueueTitle:           p.QueueTitle,
-			Volume:               float32(p.Volume),
-			ServerTime:           p.ServerTime,
-			Revision:             p.Revision,
-			CapturedAtServerTime: p.CapturedAtServerTime,
-		}
-		if p.TrackInfo != nil {
-			pbPayload.TrackInfo = trackInfoToProto(p.TrackInfo)
-		}
-		if p.Queue != nil {
-			pbPayload.Queue = make([]*pb.TrackInfo, len(p.Queue))
-			for i, track := range p.Queue {
-				pbPayload.Queue[i] = trackInfoToProto(&track)
-			}
-		}
-		return pbPayload, nil
+		return toProtoMessage(*p)
 	case *BufferReadyPayload:
-		return &pb.BufferReadyPayload{TrackId: p.TrackID}, nil
+		return &pb.BufferReadyPayload{TrackId: p.TrackID, TrackRevision: p.TrackRevision}, nil
 	case *PingPayload:
-		return &pb.PingPayload{ClientTime: p.ClientTime, Sequence: p.Sequence}, nil
+		return toProtoMessage(*p)
 	case *PongPayload:
-		return &pb.PongPayload{ClientTime: p.ClientTime, ServerReceiveTime: p.ServerReceiveTime, ServerSendTime: p.ServerSendTime, Sequence: p.Sequence}, nil
+		return toProtoMessage(*p)
 	case *KickUserPayload:
 		return &pb.KickUserPayload{UserId: p.UserID, Reason: p.Reason}, nil
 	case *TransferHostPayload:
@@ -211,9 +209,9 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 	case *ReconnectPayload:
 		return &pb.ReconnectPayload{SessionToken: p.SessionToken}, nil
 	case *ClientCapabilitiesPayload:
-		return &pb.ClientCapabilities{SupportsProtobuf: p.SupportsProtobuf, SupportsCompression: p.SupportsCompression, ClientVersion: p.ClientVersion}, nil
+		return &pb.ClientCapabilities{SupportsProtobuf: p.SupportsProtobuf, SupportsCompression: p.SupportsCompression, ClientVersion: p.ClientVersion, Features: p.Features}, nil
 	case *ServerCapabilitiesPayload:
-		return &pb.ServerCapabilities{SupportsProtobuf: p.SupportsProtobuf, SupportsCompression: p.SupportsCompression, ServerVersion: p.ServerVersion}, nil
+		return toProtoMessage(*p)
 	case *RoomCreatedPayload:
 		return &pb.RoomCreatedPayload{
 			RoomCode:     p.RoomCode,
@@ -249,23 +247,7 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 	case *KickedPayload:
 		return &pb.KickedPayload{Reason: p.Reason}, nil
 	case *SyncStatePayload:
-		pbPayload := &pb.SyncStatePayload{
-			IsPlaying:  p.IsPlaying,
-			Position:   p.Position,
-			LastUpdate: p.LastUpdate,
-			Volume:     float32(p.Volume),
-			Revision:   p.Revision,
-		}
-		if p.CurrentTrack != nil {
-			pbPayload.CurrentTrack = trackInfoToProto(p.CurrentTrack)
-		}
-		if p.Queue != nil {
-			pbPayload.Queue = make([]*pb.TrackInfo, len(p.Queue))
-			for i, track := range p.Queue {
-				pbPayload.Queue[i] = trackInfoToProto(&track)
-			}
-		}
-		return pbPayload, nil
+		return toProtoMessage(*p)
 	case *ReconnectedPayload:
 		pbPayload := &pb.ReconnectedPayload{
 			RoomCode: p.RoomCode,
@@ -341,6 +323,7 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 			LastUpdate: p.LastUpdate,
 			Volume:     float32(p.Volume),
 			Revision:   p.Revision,
+			QueueTitle: p.QueueTitle,
 		}
 		if p.CurrentTrack != nil {
 			pbPayload.CurrentTrack = trackInfoToProto(p.CurrentTrack)
@@ -395,6 +378,9 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 			ServerTime:           p.ServerTime,
 			Revision:             p.Revision,
 			CapturedAtServerTime: p.CapturedAtServerTime,
+			ReplaceQueue:         p.ReplaceQueue,
+			OriginUserId:         p.OriginUserID,
+			HostSequence:         p.HostSequence,
 		}
 		if p.TrackInfo != nil {
 			pbPayload.TrackInfo = trackInfoToProto(p.TrackInfo)
@@ -407,11 +393,26 @@ func toProtoMessage(payload interface{}) (proto.Message, error) {
 		}
 		return pbPayload, nil
 	case PingPayload:
-		return &pb.PingPayload{ClientTime: p.ClientTime, Sequence: p.Sequence}, nil
+		return &pb.PingPayload{
+			ClientTime: p.ClientTime, Sequence: p.Sequence,
+			HasPosition: p.HasPosition, TrackId: p.TrackID, Position: p.Position, PositionCapturedAtServerTime: p.PositionCapturedAtServerTime,
+			HasStateHash: p.HasStateHash, StateHash: p.StateHash,
+		}, nil
 	case PongPayload:
-		return &pb.PongPayload{ClientTime: p.ClientTime, ServerReceiveTime: p.ServerReceiveTime, ServerSendTime: p.ServerSendTime, Sequence: p.Sequence}, nil
+		return &pb.PongPayload{
+			ClientTime: p.ClientTime, ServerReceiveTime: p.ServerReceiveTime, ServerSendTime: p.ServerSendTime, Sequence: p.Sequence,
+			DriftValid: p.DriftValid, DriftMs: p.DriftMs, StateMismatch: p.StateMismatch,
+		}, nil
 	case ServerCapabilitiesPayload:
-		return &pb.ServerCapabilities{SupportsProtobuf: p.SupportsProtobuf, SupportsCompression: p.SupportsCompression, ServerVersion: p.ServerVersion}, nil
+		return &pb.ServerCapabilities{SupportsProtobuf: p.SupportsProtobuf, SupportsCompression: p.SupportsCompression, ServerVersion: p.ServerVersion, Features: p.Features, CanHost: p.CanHost}, nil
+	case ServerRestartingPayload:
+		return &pb.ServerRestartingPayload{EtaMs: p.EtaMs, Reason: p.Reason}, nil
+	case SuggestionSubmittedPayload:
+		pbPayload := &pb.SuggestionSubmittedPayload{SuggestionId: p.SuggestionID}
+		if p.TrackInfo != nil {
+			pbPayload.TrackInfo = trackInfoToProto(p.TrackInfo)
+		}
+		return pbPayload, nil
 
 	default:
 		return nil, fmt.Errorf("unsupported payload type: %T", payload)
@@ -463,6 +464,8 @@ func fromProtoMessage(msgType string, data []byte) (interface{}, error) {
 			ServerTime:           pbMsg.ServerTime,
 			Revision:             pbMsg.Revision,
 			CapturedAtServerTime: pbMsg.CapturedAtServerTime,
+			ReplaceQueue:         pbMsg.ReplaceQueue,
+			HostSequence:         pbMsg.HostSequence,
 		}
 		if pbMsg.TrackInfo != nil {
 			payload.TrackInfo = protoToTrackInfo(pbMsg.TrackInfo)
@@ -482,13 +485,18 @@ func fromProtoMessage(msgType string, data []byte) (interface{}, error) {
 		if err := proto.Unmarshal(data, &pb); err != nil {
 			return nil, err
 		}
-		return &BufferReadyPayload{TrackID: pb.TrackId}, nil
+		return &BufferReadyPayload{TrackID: pb.TrackId, TrackRevision: pb.TrackRevision}, nil
 	case MsgTypePing:
 		var pbPayload pb.PingPayload
 		if err := proto.Unmarshal(data, &pbPayload); err != nil {
 			return nil, err
 		}
-		return &PingPayload{ClientTime: pbPayload.ClientTime, Sequence: pbPayload.Sequence}, nil
+		return &PingPayload{
+			ClientTime: pbPayload.ClientTime, Sequence: pbPayload.Sequence,
+			HasPosition: pbPayload.HasPosition, TrackID: pbPayload.TrackId, Position: pbPayload.Position,
+			PositionCapturedAtServerTime: pbPayload.PositionCapturedAtServerTime,
+			HasStateHash:                 pbPayload.HasStateHash, StateHash: pbPayload.StateHash,
+		}, nil
 	case MsgTypeKickUser:
 		var pb pb.KickUserPayload
 		if err := proto.Unmarshal(data, &pb); err != nil {
@@ -534,7 +542,15 @@ func fromProtoMessage(msgType string, data []byte) (interface{}, error) {
 		if err := proto.Unmarshal(data, &pb); err != nil {
 			return nil, err
 		}
-		return &ClientCapabilitiesPayload{SupportsProtobuf: pb.SupportsProtobuf, SupportsCompression: pb.SupportsCompression, ClientVersion: pb.ClientVersion}, nil
+		if len(pb.Features) > MaxClientFeatures {
+			return nil, fmt.Errorf("more than %d client features", MaxClientFeatures)
+		}
+		for _, feature := range pb.Features {
+			if len(feature) > MaxFeatureNameLength {
+				return nil, fmt.Errorf("client feature name too long")
+			}
+		}
+		return &ClientCapabilitiesPayload{SupportsProtobuf: pb.SupportsProtobuf, SupportsCompression: pb.SupportsCompression, ClientVersion: pb.ClientVersion, Features: pb.Features}, nil
 	default:
 		return nil, fmt.Errorf("unsupported message type: %s", msgType)
 	}
@@ -608,6 +624,7 @@ func roomStateToProto(r *RoomState) *pb.RoomState {
 		LastUpdate: r.LastUpdate,
 		Volume:     float32(r.Volume),
 		Revision:   r.Revision,
+		QueueTitle: r.QueueTitle,
 	}
 
 	if r.CurrentTrack != nil {
