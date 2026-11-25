@@ -1,9 +1,11 @@
 package server
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -345,11 +347,14 @@ func TestSuggestionLimitsAckAndOfflineNotice(t *testing.T) {
 		server.handleSuggestTrack(guest, encodeTestPayload(t, MsgTypeSuggestTrack, &SuggestTrackPayload{TrackInfo: &TrackInfo{ID: id, Title: id}}))
 	}
 	suggest("one")
-	if got := receiveTestMessage(t, guest, nil); got != MsgTypeSuggestionSubmitted {
+	var first, retry pb.SuggestionSubmittedPayload
+	if got := receiveTestMessage(t, guest, &first); got != MsgTypeSuggestionSubmitted {
 		t.Fatalf("guest got %q, want suggestion_submitted", got)
 	}
 	suggest("one")
-	receiveRoomError(t, guest, "duplicate_suggestion")
+	if got := receiveTestMessage(t, guest, &retry); got != MsgTypeSuggestionSubmitted || retry.SuggestionId != first.SuggestionId {
+		t.Fatalf("retry got %q %q, want the original suggestion ID %q", got, retry.SuggestionId, first.SuggestionId)
+	}
 	for i := 1; i < MaxSuggestionsPerUser; i++ {
 		suggest(string(rune('a' + i)))
 		drainTypes(t, guest)
@@ -357,19 +362,50 @@ func TestSuggestionLimitsAckAndOfflineNotice(t *testing.T) {
 	suggest("overflow")
 	receiveRoomError(t, guest, "too_many_suggestions")
 	drainTypes(t, host)
+	// Clients without suggestion_ack keep the duplicate error.
+	withFeatures(guest)
+	suggest("one")
+	receiveRoomError(t, guest, "duplicate_suggestion")
+	withFeatures(guest, FeatureSuggestionAck)
 
 	guest.setSessionToken("guest-token")
-	server.handleClientDisconnect(guest)
-	var id string
+	var ids []string
 	for suggestionID := range room.PendingSuggestions {
-		id = suggestionID
-		break
+		ids = append(ids, suggestionID)
 	}
-	server.handleRejectSuggestion(host, encodeTestPayload(t, MsgTypeRejectSuggestion, &RejectSuggestionPayload{SuggestionID: id}))
+	// The guest's socket is closing but its cleanup has not run yet.
+	guest.closeSend()
+	server.handleRejectSuggestion(host, encodeTestPayload(t, MsgTypeRejectSuggestion, &RejectSuggestionPayload{SuggestionID: ids[0]}))
+	server.handleApproveSuggestion(host, encodeTestPayload(t, MsgTypeApproveSuggestion, &ApproveSuggestionPayload{SuggestionID: ids[1]}))
+	server.handleClientDisconnect(guest)
+	// A queue saved under the former 400 KiB budget is trimmed on restore.
+	long := strings.Repeat("x", MaxTrackTitleLength)
+	for i := 0; i < MaxQueueSize-1; i++ {
+		room.State.Queue = append(room.State.Queue, TrackInfo{ID: fmt.Sprintf("q%d", i), Title: long, Artist: long})
+	}
+	// The outcome must survive a restart before the guest returns.
+	var err error
+	server.database, err = openDatabase(filepath.Join(t.TempDir(), DefaultDatabaseFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.database.Close() })
+	if err := server.SaveState(); err != nil {
+		t.Fatal(err)
+	}
+	restored := testServer()
+	restored.database = server.database
+	if err := restored.LoadState(); err != nil {
+		t.Fatal(err)
+	}
+	server = restored
+	if queue := server.rooms[room.Code].State.Queue; len(queue) == 0 || queueWireSize(queue) > MaxQueueBytes {
+		t.Fatalf("restored queue has %d tracks and %d bytes", len(queue), queueWireSize(queue))
+	}
 	back := newClient("back", nil)
 	server.handleReconnect(back, encodeTestPayload(t, MsgTypeReconnect, &ReconnectPayload{SessionToken: "guest-token"}))
-	if types := drainTypes(t, back); !hasType(types, MsgTypeSuggestionRejected) {
-		t.Fatalf("returning guest got %v, want the rejection made while away", types)
+	if types := drainTypes(t, back); !hasType(types, MsgTypeSuggestionRejected) || !hasType(types, MsgTypeSuggestionApproved) {
+		t.Fatalf("returning guest got %v, want the decisions made while away", types)
 	}
 }
 

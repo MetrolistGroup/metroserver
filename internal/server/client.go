@@ -406,9 +406,10 @@ func (c *Client) rewritePayload(payload interface{}) interface{} {
 	return rewriteForUATier(c.uaTier, c.policy.advertTitle, payload)
 }
 
-func (c *Client) sendMessage(logger *zap.Logger, msgType string, payload interface{}) {
+// sendMessage reports whether the message was queued for the writer.
+func (c *Client) sendMessage(logger *zap.Logger, msgType string, payload interface{}) bool {
 	if c == nil || c.codec == nil || c.Send == nil {
-		return
+		return false
 	}
 	payload = c.rewritePayload(payload)
 
@@ -416,7 +417,7 @@ func (c *Client) sendMessage(logger *zap.Logger, msgType string, payload interfa
 	msgData, err := c.codec.Encode(msgType, payload)
 	if err != nil {
 		logger.Error("Error encoding message", zap.String("message_type", msgType), zap.String("payload_type", fmt.Sprintf("%T", payload)), zap.Error(err))
-		return
+		return false
 	}
 
 	logger.Debug("Message encoded successfully",
@@ -424,7 +425,7 @@ func (c *Client) sendMessage(logger *zap.Logger, msgType string, payload interfa
 		zap.String("payload_type", fmt.Sprintf("%T", payload)),
 		zap.Int("encoded_size_bytes", len(msgData)))
 
-	c.sendEncodedMessage(logger, msgType, msgData)
+	return c.sendEncodedMessage(logger, msgType, msgData)
 }
 
 // reply sends a direct response to the message currently being handled,
@@ -442,9 +443,9 @@ func (c *Client) reply(logger *zap.Logger, msgType string, payload interface{}) 
 	c.sendEncodedMessage(logger, msgType, msgData)
 }
 
-func (c *Client) sendEncodedMessage(logger *zap.Logger, msgType string, msgData []byte) {
+func (c *Client) sendEncodedMessage(logger *zap.Logger, msgType string, msgData []byte) bool {
 	if c == nil || c.Send == nil {
-		return
+		return false
 	}
 
 	c.mu.Lock()
@@ -452,7 +453,7 @@ func (c *Client) sendEncodedMessage(logger *zap.Logger, msgType string, msgData 
 
 	if c.closed {
 		logger.Debug("Attempted to send to closed client", zap.String("client_id", c.clientID()))
-		return
+		return false
 	}
 
 	if c.queuedBytes+len(msgData) <= MaxQueuedBytes {
@@ -460,7 +461,7 @@ func (c *Client) sendEncodedMessage(logger *zap.Logger, msgType string, msgData 
 		case c.Send <- msgData:
 			c.queuedBytes += len(msgData)
 			logger.Debug("Message queued for sending", zap.String("message_type", msgType), zap.Int("size", len(msgData)))
-			return
+			return true
 		default:
 		}
 	}
@@ -472,6 +473,7 @@ func (c *Client) sendEncodedMessage(logger *zap.Logger, msgType string, msgData 
 	if c.Conn != nil {
 		_ = c.Conn.Close()
 	}
+	return false
 }
 
 func sendMessageToClients(logger *zap.Logger, clients []*Client, msgType string, payload interface{}) {

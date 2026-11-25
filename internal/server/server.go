@@ -118,9 +118,9 @@ const (
 	MaxPendingJoins       = 100
 	MaxPendingSuggestions = 100
 	MaxSuggestionsPerUser = 10
-	// MaxQueueBytes keeps every queue snapshot decodable by clients and
-	// sendable uncompressed within MaxReadMessageSize.
-	MaxQueueBytes = 400 * 1024
+	// MaxQueueBytes keeps every queue snapshot, with room metadata, inside the
+	// 256 KiB envelope limit of Metrolist clients even without compression.
+	MaxQueueBytes = 200 * 1024
 	// Connection limits
 	MaxClients              = 10000
 	MaxRooms                = 10000

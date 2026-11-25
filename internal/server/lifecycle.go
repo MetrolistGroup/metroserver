@@ -179,9 +179,6 @@ func (s *Server) cleanupEmptyRoomsOnce(now time.Time) {
 }
 
 func (s *Server) removeClient(c *Client) {
-	s.mu.Lock()
-	delete(s.clients, c)
-	s.mu.Unlock()
 	c.closeSend()
 
 	if c.currentRoom() != nil {
@@ -192,6 +189,11 @@ func (s *Server) removeClient(c *Client) {
 			s.handleClientDisconnect(c)
 		}
 	}
+	// Stay listed until the reconnect session exists, so a concurrent reconnect
+	// either claims that session or finds this connection to replace.
+	s.mu.Lock()
+	delete(s.clients, c)
+	s.mu.Unlock()
 
 	s.logger.Info("Client disconnected", zap.String("client_id", c.clientID()))
 }
@@ -358,7 +360,10 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 		return session, ""
 	}
 	session, failure := claim()
-	if failure == "session_not_found" && s.replaceLiveSession(c, p.SessionToken) {
+	if failure == "session_not_found" {
+		// The old connection may have published its session after the first
+		// claim, so claim again whether or not a live connection was replaced.
+		s.replaceLiveSession(c, p.SessionToken)
 		session, failure = claim()
 	}
 	switch failure {
@@ -461,8 +466,21 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 		IsHost:   isHost,
 	})
 	s.sendPolicyQueueSnapshot(c, liveState)
-	for _, notice := range notices {
-		c.sendMessage(s.logger, notice.MsgType, notice.Payload)
+	for i, notice := range notices {
+		if !c.sendMessage(s.logger, notice.MsgType, notice.Payload) {
+			// The connection closed mid-replay; keep the rest for the next reconnect.
+			room.mu.Lock()
+			pending := append(append([]pendingNotice(nil), notices[i:]...), room.PendingNotices[session.UserID]...)
+			if len(pending) > MaxSuggestionsPerUser {
+				pending = pending[:MaxSuggestionsPerUser]
+			}
+			if room.PendingNotices == nil {
+				room.PendingNotices = make(map[string][]pendingNotice)
+			}
+			room.PendingNotices[session.UserID] = pending
+			room.mu.Unlock()
+			break
+		}
 	}
 
 	sendMessageToClients(s.logger, others, MsgTypeUserReconnected, UserReconnectedPayload{

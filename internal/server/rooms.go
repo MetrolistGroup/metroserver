@@ -50,22 +50,32 @@ func (s *Server) handleSuggestTrack(c *Client, payload []byte) {
 	if room.PendingSuggestions == nil {
 		room.PendingSuggestions = make(map[string]*Suggestion)
 	}
-	if len(room.PendingSuggestions) >= MaxPendingSuggestions {
-		room.mu.Unlock()
-		c.sendError(s.logger, "suggestions_full", "Too many pending suggestions")
-		return
-	}
 	mine := 0
 	for _, pending := range room.PendingSuggestions {
 		if pending == nil || pending.FromUserID != clientID {
 			continue
 		}
 		if pending.Track != nil && pending.Track.ID == p.TrackInfo.ID {
-			room.mu.Unlock()
-			c.sendError(s.logger, "duplicate_suggestion", "You already suggested this track")
+			// A retry after a lost acknowledgement recovers the original ID. Reply
+			// under room.mu so a host decision cannot overtake it.
+			if c.hasFeature(FeatureSuggestionAck) {
+				c.reply(s.logger, MsgTypeSuggestionSubmitted, SuggestionSubmittedPayload{
+					SuggestionID: pending.ID,
+					TrackInfo:    cloneTrackInfo(pending.Track),
+				})
+				room.mu.Unlock()
+			} else {
+				room.mu.Unlock()
+				c.sendError(s.logger, "duplicate_suggestion", "You already suggested this track")
+			}
 			return
 		}
 		mine++
+	}
+	if len(room.PendingSuggestions) >= MaxPendingSuggestions {
+		room.mu.Unlock()
+		c.sendError(s.logger, "suggestions_full", "Too many pending suggestions")
+		return
 	}
 	if mine >= MaxSuggestionsPerUser {
 		room.mu.Unlock()
@@ -92,16 +102,18 @@ func (s *Server) handleSuggestTrack(c *Client, payload []byte) {
 		FromUsername: username,
 		TrackInfo:    cloneTrackInfo(p.TrackInfo),
 	}
-	room.mu.Unlock()
-
-	if hostConnected {
-		host.sendMessage(s.logger, MsgTypeSuggestionReceived, notification)
-	}
+	// Queue the guest's acknowledgement before the host can see the suggestion,
+	// so an automatic decision never reaches the guest ahead of its ID.
 	if c.hasFeature(FeatureSuggestionAck) {
 		c.reply(s.logger, MsgTypeSuggestionSubmitted, SuggestionSubmittedPayload{
 			SuggestionID: sugID,
 			TrackInfo:    cloneTrackInfo(p.TrackInfo),
 		})
+	}
+	room.mu.Unlock()
+
+	if hostConnected {
+		host.sendMessage(s.logger, MsgTypeSuggestionReceived, notification)
 	}
 
 	s.logger.Info("Suggestion received",
@@ -179,7 +191,7 @@ func (s *Server) handleApproveSuggestion(c *Client, payload []byte) {
 	clients := roomClientsLocked(room)
 
 	// Notify suggester of approval
-	target := room.Clients[suggestion.FromUserID]
+	target := liveClientLocked(room, suggestion.FromUserID)
 	approved := SuggestionApprovedPayload{
 		SuggestionID: p.SuggestionID,
 		TrackInfo:    cloneTrackInfo(suggestion.Track),
@@ -195,8 +207,11 @@ func (s *Server) handleApproveSuggestion(c *Client, payload []byte) {
 	room.mu.Unlock()
 
 	sendMessageToClients(s.logger, clients, MsgTypeSyncPlayback, qa)
-	if target != nil {
-		target.sendMessage(s.logger, MsgTypeSuggestionApproved, approved)
+	if target != nil && !target.sendMessage(s.logger, MsgTypeSuggestionApproved, approved) {
+		// The broadcast or a full buffer closed the guest; keep the outcome for its return.
+		room.mu.Lock()
+		queueNoticeLocked(room, suggestion.FromUserID, MsgTypeSuggestionApproved, approved)
+		room.mu.Unlock()
 	}
 
 	s.logger.Info("Suggestion approved",
@@ -219,6 +234,8 @@ func (s *Server) handleRejectSuggestion(c *Client, payload []byte) {
 		c.sendError(s.logger, "not_in_room", "You are not in a room")
 		return
 	}
+	room.syncMu.Lock()
+	defer room.syncMu.Unlock()
 	room.mu.Lock()
 	if room.Host == nil || room.Host != c || room.HostDisconnectedAt != nil {
 		room.mu.Unlock()
@@ -235,7 +252,7 @@ func (s *Server) handleRejectSuggestion(c *Client, payload []byte) {
 
 	// Notify suggester of rejection
 	reason := sanitizeString(p.Reason, 200)
-	target := room.Clients[suggestion.FromUserID]
+	target := liveClientLocked(room, suggestion.FromUserID)
 	if target == nil {
 		queueNoticeLocked(room, suggestion.FromUserID, MsgTypeSuggestionRejected, SuggestionRejectedPayload{
 			SuggestionID: p.SuggestionID,
@@ -250,10 +267,12 @@ func (s *Server) handleRejectSuggestion(c *Client, payload []byte) {
 	room.mu.Unlock()
 
 	if target != nil {
-		target.sendMessage(s.logger, MsgTypeSuggestionRejected, SuggestionRejectedPayload{
-			SuggestionID: p.SuggestionID,
-			Reason:       reason,
-		})
+		rejected := SuggestionRejectedPayload{SuggestionID: p.SuggestionID, Reason: reason}
+		if !target.sendMessage(s.logger, MsgTypeSuggestionRejected, rejected) {
+			room.mu.Lock()
+			queueNoticeLocked(room, suggestion.FromUserID, MsgTypeSuggestionRejected, rejected)
+			room.mu.Unlock()
+		}
 	}
 
 	s.logger.Info("Suggestion rejected",
@@ -921,9 +940,20 @@ func removeUserSuggestionsLocked(room *Room, userID string) {
 	}
 }
 
+// liveClientLocked returns the member's connection unless it is closing.
+func liveClientLocked(room *Room, userID string) *Client {
+	if client := room.Clients[userID]; client != nil && !client.isClosed() {
+		return client
+	}
+	return nil
+}
+
 // queueNoticeLocked keeps a message for a disconnected member until they reconnect.
+// A member whose connection is closing counts as disconnected: its session is
+// published as soon as the cleanup that is waiting for room.syncMu runs.
 func queueNoticeLocked(room *Room, userID, msgType string, payload interface{}) {
-	if _, away := room.DisconnectedUsers[userID]; !away {
+	_, away := room.DisconnectedUsers[userID]
+	if client := room.Clients[userID]; !away && (client == nil || !client.isClosed()) {
 		return
 	}
 	if room.PendingNotices == nil {
