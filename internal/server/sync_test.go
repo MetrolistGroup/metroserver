@@ -345,11 +345,14 @@ func TestSuggestionLimitsAckAndOfflineNotice(t *testing.T) {
 		server.handleSuggestTrack(guest, encodeTestPayload(t, MsgTypeSuggestTrack, &SuggestTrackPayload{TrackInfo: &TrackInfo{ID: id, Title: id}}))
 	}
 	suggest("one")
-	if got := receiveTestMessage(t, guest, nil); got != MsgTypeSuggestionSubmitted {
+	var first, retry pb.SuggestionSubmittedPayload
+	if got := receiveTestMessage(t, guest, &first); got != MsgTypeSuggestionSubmitted {
 		t.Fatalf("guest got %q, want suggestion_submitted", got)
 	}
 	suggest("one")
-	receiveRoomError(t, guest, "duplicate_suggestion")
+	if got := receiveTestMessage(t, guest, &retry); got != MsgTypeSuggestionSubmitted || retry.SuggestionId != first.SuggestionId {
+		t.Fatalf("retry got %q %q, want the original suggestion ID %q", got, retry.SuggestionId, first.SuggestionId)
+	}
 	for i := 1; i < MaxSuggestionsPerUser; i++ {
 		suggest(string(rune('a' + i)))
 		drainTypes(t, guest)
@@ -359,13 +362,31 @@ func TestSuggestionLimitsAckAndOfflineNotice(t *testing.T) {
 	drainTypes(t, host)
 
 	guest.setSessionToken("guest-token")
-	server.handleClientDisconnect(guest)
 	var id string
 	for suggestionID := range room.PendingSuggestions {
 		id = suggestionID
 		break
 	}
+	// The guest's socket is closing but its cleanup has not run yet.
+	guest.closeSend()
 	server.handleRejectSuggestion(host, encodeTestPayload(t, MsgTypeRejectSuggestion, &RejectSuggestionPayload{SuggestionID: id}))
+	server.handleClientDisconnect(guest)
+	// The outcome must survive a restart before the guest returns.
+	var err error
+	server.database, err = openDatabase(filepath.Join(t.TempDir(), DefaultDatabaseFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.database.Close() })
+	if err := server.SaveState(); err != nil {
+		t.Fatal(err)
+	}
+	restored := testServer()
+	restored.database = server.database
+	if err := restored.LoadState(); err != nil {
+		t.Fatal(err)
+	}
+	server = restored
 	back := newClient("back", nil)
 	server.handleReconnect(back, encodeTestPayload(t, MsgTypeReconnect, &ReconnectPayload{SessionToken: "guest-token"}))
 	if types := drainTypes(t, back); !hasType(types, MsgTypeSuggestionRejected) {

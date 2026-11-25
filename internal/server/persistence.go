@@ -46,6 +46,62 @@ type PersistentRoom struct {
 	DisconnectedUsers  map[string]*Session    `json:"disconnected_users"`
 	PendingSuggestions []PersistentSuggestion `json:"pending_suggestions"`
 	HostDisconnectedAt *time.Time             `json:"host_disconnected_at,omitempty"`
+	// PendingNotices keeps suggestion outcomes for members who are away.
+	PendingNotices map[string][]PersistentNotice `json:"pending_notices,omitempty"`
+}
+
+// PersistentNotice is a serializable suggestion outcome waiting for a member.
+type PersistentNotice struct {
+	Type         string     `json:"type"`
+	SuggestionID string     `json:"suggestion_id"`
+	Track        *TrackInfo `json:"track,omitempty"`
+	Reason       string     `json:"reason,omitempty"`
+}
+
+func persistNotices(notices map[string][]pendingNotice) map[string][]PersistentNotice {
+	persisted := make(map[string][]PersistentNotice, len(notices))
+	for userID, pending := range notices {
+		for _, notice := range pending {
+			switch payload := notice.Payload.(type) {
+			case SuggestionApprovedPayload:
+				persisted[userID] = append(persisted[userID], PersistentNotice{
+					Type: notice.MsgType, SuggestionID: payload.SuggestionID, Track: cloneTrackInfo(payload.TrackInfo),
+				})
+			case SuggestionRejectedPayload:
+				persisted[userID] = append(persisted[userID], PersistentNotice{
+					Type: notice.MsgType, SuggestionID: payload.SuggestionID, Reason: payload.Reason,
+				})
+			}
+		}
+	}
+	if len(persisted) == 0 {
+		return nil
+	}
+	return persisted
+}
+
+func restoreNotices(persisted map[string][]PersistentNotice) map[string][]pendingNotice {
+	notices := make(map[string][]pendingNotice, len(persisted))
+	for userID, pending := range persisted {
+		for _, notice := range pending {
+			if notice.SuggestionID == "" || len(notices[userID]) >= MaxSuggestionsPerUser {
+				continue
+			}
+			switch notice.Type {
+			case MsgTypeSuggestionApproved:
+				notices[userID] = append(notices[userID], pendingNotice{
+					MsgType: notice.Type,
+					Payload: SuggestionApprovedPayload{SuggestionID: notice.SuggestionID, TrackInfo: notice.Track},
+				})
+			case MsgTypeSuggestionRejected:
+				notices[userID] = append(notices[userID], pendingNotice{
+					MsgType: notice.Type,
+					Payload: SuggestionRejectedPayload{SuggestionID: notice.SuggestionID, Reason: notice.Reason},
+				})
+			}
+		}
+	}
+	return notices
 }
 
 // PersistentSuggestion is a serializable version of Suggestion
@@ -173,6 +229,7 @@ func persistRoomLocked(s *Server, room *Room, sessions []PersistentSession) (roo
 			DisconnectedUsers:  disconnectedUsers,
 			PendingSuggestions: pendingSuggestions,
 			HostDisconnectedAt: room.HostDisconnectedAt,
+			PendingNotices:     persistNotices(room.PendingNotices),
 		},
 		Sessions: sessions,
 	}, true
@@ -464,15 +521,12 @@ func (s *Server) restoreRoomLocked(record roomRecord, flushedAt time.Time, offli
 	for i := range state.Users {
 		state.Users[i].IsConnected = false
 	}
+	// Reported durations can be placeholders, so restored playback keeps the
+	// host's timeline like live playback does; the host republishes on return.
 	state.Queue = sanitizeQueue(state.Queue)
-	if state.IsPlaying && state.CurrentTrack != nil && state.CurrentTrack.Duration > 0 {
-		// After a long outage the projection can run past the end; park it there
-		// rather than claim the room is still playing nothing.
-		if nowMs := serverNowMs(); livePlaybackPosition(state, nowMs) >= state.CurrentTrack.Duration {
-			state.IsPlaying = false
-			state.Position = state.CurrentTrack.Duration
-			state.LastUpdate = nowMs
-		}
+	// Rooms saved under the former 400 KiB budget must not reach clients over their envelope limit.
+	for len(state.Queue) > 0 && queueWireSize(state.Queue) > MaxQueueBytes {
+		state.Queue = state.Queue[:len(state.Queue)-1]
 	}
 
 	room := &Room{
@@ -485,6 +539,7 @@ func (s *Server) restoreRoomLocked(record roomRecord, flushedAt time.Time, offli
 		State:              state,
 		OwnerID:            persistentRoom.OwnerID,
 		TrackRevision:      persistentRoom.TrackRevision,
+		PendingNotices:     restoreNotices(persistentRoom.PendingNotices),
 	}
 	for _, ps := range persistentRoom.PendingSuggestions {
 		room.PendingSuggestions[ps.ID] = &Suggestion{
@@ -512,6 +567,12 @@ func (s *Server) restoreRoomLocked(record roomRecord, flushedAt time.Time, offli
 		}
 		session.DisconnectAt = disconnectedAt(session.DisconnectAt)
 		room.DisconnectedUsers[userID] = session
+	}
+
+	for userID := range room.PendingNotices {
+		if _, away := room.DisconnectedUsers[userID]; !away {
+			delete(room.PendingNotices, userID)
+		}
 	}
 
 	if persistentRoom.HostDisconnectedAt != nil {
