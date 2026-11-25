@@ -234,6 +234,8 @@ func (s *Server) handleRejectSuggestion(c *Client, payload []byte) {
 		c.sendError(s.logger, "not_in_room", "You are not in a room")
 		return
 	}
+	room.syncMu.Lock()
+	defer room.syncMu.Unlock()
 	room.mu.Lock()
 	if room.Host == nil || room.Host != c || room.HostDisconnectedAt != nil {
 		room.mu.Unlock()

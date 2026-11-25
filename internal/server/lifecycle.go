@@ -466,8 +466,21 @@ func (s *Server) handleReconnect(c *Client, payload []byte) {
 		IsHost:   isHost,
 	})
 	s.sendPolicyQueueSnapshot(c, liveState)
-	for _, notice := range notices {
-		c.sendMessage(s.logger, notice.MsgType, notice.Payload)
+	for i, notice := range notices {
+		if !c.sendMessage(s.logger, notice.MsgType, notice.Payload) {
+			// The connection closed mid-replay; keep the rest for the next reconnect.
+			room.mu.Lock()
+			pending := append(append([]pendingNotice(nil), notices[i:]...), room.PendingNotices[session.UserID]...)
+			if len(pending) > MaxSuggestionsPerUser {
+				pending = pending[:MaxSuggestionsPerUser]
+			}
+			if room.PendingNotices == nil {
+				room.PendingNotices = make(map[string][]pendingNotice)
+			}
+			room.PendingNotices[session.UserID] = pending
+			room.mu.Unlock()
+			break
+		}
 	}
 
 	sendMessageToClients(s.logger, others, MsgTypeUserReconnected, UserReconnectedPayload{
