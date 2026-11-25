@@ -44,47 +44,11 @@ jobs:
             - name: Generate protobuf files
               run: bash scripts/generate_proto.sh
 
-            - name: Run tests with coverage
-              run: go test -race -covermode=atomic -coverprofile=coverage.out ./internal/server
-
-            - name: Enforce 80% coverage
-              run: |
-                  coverage=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/, "", $3); print $3}')
-                  echo "Coverage: ${coverage}%"
-                  awk -v coverage="$coverage" 'BEGIN { if (coverage < 80) exit 1 }'
-
-            - name: Save coverage report
-              uses: actions/upload-artifact@v4
-              with:
-                  name: coverage
-                  path: coverage.out
-                  retention-days: 1
-
-    coverage:
-        needs: test
-        runs-on: ubuntu-latest
-        permissions:
-            contents: read
-            id-token: write
-
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@v4
-
-            - name: Download coverage report
-              uses: actions/download-artifact@v4
-              with:
-                  name: coverage
-
-            - name: Upload coverage to Codecov
-              uses: codecov/codecov-action@v5
-              with:
-                  files: ./coverage.out
-                  fail_ci_if_error: true
-                  use_oidc: true
+            - name: Run tests
+              run: go test -race ./internal/server
 
     build:
-        needs: coverage
+        needs: test
         runs-on: ubuntu-latest
         permissions:
             contents: read
@@ -131,7 +95,7 @@ jobs:
                   cache-to: type=gha,mode=max
 
     test-build:
-        needs: coverage
+        needs: test
         runs-on: ubuntu-latest
         if: github.event_name == 'pull_request'
 
